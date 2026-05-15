@@ -1,0 +1,298 @@
+const path = require('path');
+const mongoose = require('mongoose');
+const asyncHandler = require('../utils/asyncHandler');
+const { sendSuccess, sendError } = require('../utils/responseHandler');
+const LoanApplication = require('../models/LoanApplication');
+const LoanEmployment = require('../models/LoanEmployment');
+const LoanBanking = require('../models/LoanBanking');
+const LoanDocument = require('../models/LoanDocument');
+const LoanStatusHistory = require('../models/LoanStatusHistory');
+const LoanAssignment = require('../models/LoanAssignment');
+const SystemSettings = require('../models/SystemSettings');
+const Notification = require('../models/Notification');
+const Conversation = require('../models/Conversation');
+const Message = require('../models/Message');
+const User = require('../models/User');
+const { getIO } = require('../socket/socketServer');
+const imagekit = require('../config/imagekit');
+
+// @desc    Get Loan Estimate
+// @route   GET /api/borrower/apply-loan/estimate
+// @access  Protected
+exports.getLoanEstimate = asyncHandler(async (req, res, next) => {
+  const { amount, duration } = req.query;
+
+  if (!amount || !duration) return sendError(res, 'Amount and duration required', 400);
+
+  const settings = await SystemSettings.findOne();
+  const interestRate = settings ? settings.defaultInterestRate : 12.5;
+  const processingFeeValue = settings ? settings.processingFeeValue : 250;
+  const processingFeeType = settings ? settings.processingFeeType : 'Fixed Amount';
+
+  let processingFee = processingFeeValue;
+  if (processingFeeType === 'Percentage') {
+    processingFee = (amount * processingFeeValue) / 100;
+  }
+
+  const totalInterest = (amount * (interestRate / 100) * (duration / 12));
+  const totalRepayment = parseFloat(amount) + totalInterest + processingFee;
+  const estimatedMonthlyEMI = totalRepayment / duration;
+
+  sendSuccess(res, 'Loan estimate generated', {
+    requestedAmount: amount,
+    processingFee,
+    interestRate,
+    estimatedMonthlyEMI,
+    totalRepayment,
+    duration
+  });
+});
+
+// @desc    Document Upload (To ImageKit only, no DB entry yet)
+// @route   POST /api/borrower/apply-loan/upload
+// @access  Protected
+exports.uploadOnly = asyncHandler(async (req, res, next) => {
+  if (!req.file) return sendError(res, 'No file uploaded', 400);
+
+  // Upload to ImageKit
+  const uploadResponse = await imagekit.upload({
+    file: req.file.buffer,
+    fileName: `temp-${req.user._id}-${Date.now()}${path.extname(req.file.originalname)}`,
+    folder: `/loans/temp/${req.user._id}`
+  });
+
+  sendSuccess(res, 'File uploaded to ImageKit', { 
+    url: uploadResponse.url, 
+    fileId: uploadResponse.fileId,
+    fileName: req.file.originalname,
+    fileSize: req.file.size
+  });
+});
+
+// @desc    Submit Complete Loan Application (Atomic Transaction)
+// @route   POST /api/borrower/apply-loan/submit-full
+// @access  Protected
+exports.submitFullApplication = asyncHandler(async (req, res, next) => {
+  const {
+    personal,
+    employment,
+    banking,
+    documents,
+    confirmationAccepted,
+    creditConsentAccepted,
+    creditConsentAcceptedAt,
+  } = req.body;
+
+  if (!confirmationAccepted) return sendError(res, 'Please accept confirmation', 400);
+  if (!creditConsentAccepted) return sendError(res, 'Credit check consent is required', 400);
+
+  if (!personal || !employment || !banking) {
+    return sendError(res, 'Missing required information blocks', 400);
+  }
+
+  // South Africa Phone Format
+  const saPhoneRegex = /^0\d{9}$/;
+  if (!saPhoneRegex.test(personal.phoneNumber)) {
+    return sendError(res, 'Invalid South Africa phone format', 400);
+  }
+
+  // Unique ID Check
+  const existingApp = await LoanApplication.findOne({ idNumber: personal.idNumber, status: { $ne: 'Rejected' } });
+  if (existingApp) {
+    return sendError(res, 'An active application with this ID Number already exists', 400);
+  }
+
+  const settings = await SystemSettings.findOne();
+  const interestRate = settings ? settings.defaultInterestRate : 12.5;
+  const processingFeeValue = settings ? settings.processingFeeValue : 250;
+  const processingFeeType = settings ? settings.processingFeeType : 'Fixed Amount';
+  
+  let processingFee = processingFeeValue;
+  if (processingFeeType === 'Percentage') {
+    processingFee = (banking.requestedLoanAmount * processingFeeValue) / 100;
+  }
+
+  const amount = Number(banking.requestedLoanAmount);
+  const duration = Number(banking.requestedDuration);
+
+  const totalInterest = (amount * (interestRate / 100) * (duration / 12));
+  const totalRepayment = amount + totalInterest + processingFee;
+  const estimatedMonthlyEMI = totalRepayment / duration;
+
+  // Compute credit-risk readiness fields
+  const REQUIRED_DOC_TYPES = ['ID Document', 'Payslip', 'Bank Statement', 'Proof Of Address'];
+  const submittedDocTypes = (documents || []).map(d => d.type);
+  const allDocsPresent = REQUIRED_DOC_TYPES.every(t => submittedDocTypes.includes(t));
+
+  const documentVerificationStatus = allDocsPresent ? 'Complete' : submittedDocTypes.length > 0 ? 'Incomplete' : 'Pending';
+  const creditRiskReady = allDocsPresent && !!creditConsentAccepted;
+  let applicationAuditStatus = 'Incomplete';
+  if (creditRiskReady) applicationAuditStatus = 'Ready For Review';
+  else if (!allDocsPresent) applicationAuditStatus = 'Missing Documents';
+  else if (!creditConsentAccepted) applicationAuditStatus = 'Credit Consent Missing';
+
+  // --- START TRANSACTION ---
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // 1. Create Loan Application Record
+    const [application] = await LoanApplication.create([{
+      borrowerId: req.user._id,
+      fullName: personal.fullName,
+      phoneNumber: personal.phoneNumber,
+      emailAddress: personal.emailAddress,
+      idNumber: personal.idNumber,
+      dateOfBirth: personal.dateOfBirth,
+      residentialAddress: personal.residentialAddress,
+      requestedAmount: amount,
+      requestedDuration: duration,
+      processingFee,
+      interestRate,
+      estimatedMonthlyEMI,
+      totalRepayment,
+      status: 'Submitted',
+      confirmationAccepted: true,
+      submittedAt: new Date(),
+      creditConsentAccepted: true,
+      creditConsentAcceptedAt: creditConsentAcceptedAt ? new Date(creditConsentAcceptedAt) : new Date(),
+      documentVerificationStatus,
+      creditRiskReady,
+      applicationAuditStatus,
+    }], { session });
+
+    // 2. Create Related Records
+    await LoanEmployment.create([{
+      loanApplicationId: application._id,
+      ...employment
+    }], { session });
+
+    await LoanBanking.create([{
+      loanApplicationId: application._id,
+      ...banking
+    }], { session });
+
+    if (documents && documents.length > 0) {
+      const docRecords = documents.map(doc => ({
+        loanApplicationId: application._id,
+        documentType: doc.type,
+        fileUrl: doc.fileUrl || doc.url || doc.fileURL || (doc.data && doc.data.url),
+        fileId: doc.fileId || (doc.data && doc.data.fileId),
+        fileName: doc.fileName || (doc.data && doc.data.fileName),
+        fileSize: doc.fileSize || (doc.data && doc.data.fileSize)
+      }));
+      await LoanDocument.insertMany(docRecords, { session });
+    }
+
+    await LoanStatusHistory.create([{
+      loanApplicationId: application._id,
+      status: 'Submitted',
+      notes: 'Loan application submitted by borrower (Full)',
+      changedBy: req.user._id
+    }], { session });
+
+    // 3. Communications & Notifications
+    const admin = await User.findOne({ role: 'admin' });
+    
+    let io;
+    try { io = getIO(); } catch (e) {}
+
+    if (admin) {
+      // Reuse existing borrower↔admin conversation to avoid duplicates
+      let existingConv = await Conversation.findOne({
+        participants: { $all: [req.user._id, admin._id] },
+        isActive: true,
+        isDeleted: false
+      }).session(session);
+
+      let conversation;
+      if (existingConv) {
+        await Conversation.findByIdAndUpdate(
+          existingConv._id,
+          { lastMessage: 'New loan application submitted', lastMessageAt: new Date() },
+          { session }
+        );
+        conversation = [existingConv];
+      } else {
+        conversation = await Conversation.create([{
+          participants: [req.user._id, admin._id],
+          participantRoles: ['borrower', 'admin'],
+          conversationType: 'Borrower',
+          lastMessage: 'New loan application submitted',
+          lastMessageAt: new Date()
+        }], { session });
+      }
+
+      application.conversationId = conversation[0]._id;
+      await application.save({ session });
+
+      await Notification.create([{
+        receiverId: admin._id,
+        receiverRole: 'admin',
+        senderId: req.user._id,
+        senderRole: 'borrower',
+        loanApplicationId: application._id,
+        type: 'NewLoanRequest',
+        title: 'New Loan Application',
+        message: `New application ${application.applicationId} received from ${application.fullName}`,
+        priority: 'IMPORTANT'
+      }], { session });
+    }
+
+    // 4. Auto Assignment
+    if (settings && settings.enableAutoAssignment) {
+      const agents = await User.find({ role: 'agent', isActive: true });
+      if (agents.length > 0) {
+        const assignedAgent = agents[Math.floor(Math.random() * agents.length)];
+        await LoanAssignment.create([{
+          loanApplicationId: application._id,
+          assignedAgentId: assignedAgent._id,
+          assignmentType: 'Auto'
+        }], { session });
+      }
+
+      const staffMembers = await User.find({ role: 'staff', isActive: true });
+      if (staffMembers.length > 0) {
+        const assignedStaff = staffMembers[Math.floor(Math.random() * staffMembers.length)];
+        await LoanAssignment.findOneAndUpdate(
+          { loanApplicationId: application._id },
+          { assignedStaffId: assignedStaff._id },
+          { upsert: true, session }
+        );
+      }
+    }
+
+    // --- COMMIT TRANSACTION ---
+    await session.commitTransaction();
+    session.endSession();
+
+    // Trigger Real-time (After commit)
+    if (io && admin) {
+      io.to(admin._id.toString()).emit('newNotification', { 
+        title: 'New Loan Application', 
+        message: `New application: ${application.applicationId}` 
+      });
+    }
+
+    sendSuccess(res, 'Application submitted successfully', { application });
+
+  } catch (error) {
+    // --- ROLLBACK TRANSACTION ---
+    await session.abortTransaction();
+    session.endSession();
+    throw error;
+  }
+});
+
+// @desc    Get Application Status
+// @route   GET /api/borrower/apply-loan/status/:applicationId
+// @access  Protected
+exports.getApplicationStatus = asyncHandler(async (req, res, next) => {
+  const application = await LoanApplication.findById(req.params.applicationId);
+  if (!application) return sendError(res, 'Application not found', 404);
+  const history = await LoanStatusHistory.find({ loanApplicationId: application._id }).sort({ createdAt: 1 });
+  sendSuccess(res, 'Application status retrieved', {
+    currentStatus: application.status,
+    timeline: history
+  });
+});
