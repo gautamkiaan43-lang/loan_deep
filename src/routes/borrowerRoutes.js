@@ -3,7 +3,8 @@ const router = express.Router();
 const { 
   getMyLoans, 
   getEmiSchedule, 
-  downloadStatement 
+  downloadStatement,
+  getEligibilitySettings
 } = require('../controllers/borrower/loanController');
 const { 
   getPaymentDashboard, 
@@ -29,6 +30,7 @@ router.use(protect);
 
 router.get('/dashboard', getBorrowerDashboard);
 router.get('/my-loans', getMyLoans);
+router.get('/eligibility-settings', getEligibilitySettings);
 router.get('/emi-schedule/:loanId', getEmiSchedule);
 router.post('/download-loan-statement', downloadStatement);
 

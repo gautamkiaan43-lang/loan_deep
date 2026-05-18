@@ -135,6 +135,25 @@ const resetSettings = asyncHandler(async (req, res) => {
 });
 
 /**
+ * @desc    Update system settings in bulk
+ * @route   PUT /api/admin/settings/bulk
+ * @access  Private/Admin
+ */
+const updateBulkSettings = asyncHandler(async (req, res) => {
+  let settings = await getOrInitSettings();
+
+  Object.keys(req.body).forEach(key => {
+    // If the key is a valid field on the document, update it
+    if (key !== '_id' && key !== '__v') {
+      settings[key] = req.body[key];
+    }
+  });
+
+  await settings.save();
+  sendSuccess(res, 'System settings updated successfully', settings);
+});
+
+/**
  * @desc    Calculate live logic preview without saving
  * @route   POST /api/admin/settings/live-preview
  * @access  Private/Admin
@@ -142,27 +161,53 @@ const resetSettings = asyncHandler(async (req, res) => {
 const calculateLivePreview = asyncHandler(async (req, res) => {
   const temp = req.body; // Contains unsaved client settings
   
-  // Calculate mock Monthly Repayment based on principal = 10000 over 12 months
+  // Calculate dynamic Monthly Repayment based on principal = 10000 over 12 months using South African NCR fees
   const P = 10000;
   const N = 12;
   const rate = Number(temp.defaultInterestRate || 12.5);
   
-  let monthlyRepayment = 0;
+  // 1. Calculate Initiation Fee
+  let initiationFee = 0;
+  const initType = temp.initiationFeeType || 'Percentage';
+  const initVal = Number(temp.initiationFeeValue || 10);
+  if (initType === 'Percentage') {
+    initiationFee = (P * initVal) / 100;
+  } else {
+    initiationFee = initVal;
+  }
   
+  // 2. Monthly Service Fee
+  const monthlyServiceFee = Number(temp.monthlyServiceFee || 60);
+  
+  // 3. Insurance Fee (Credit Life Insurance)
+  const insuranceRate = Number(temp.creditLifeInsuranceRate || 1.2);
+  const insuranceFee = (P * insuranceRate) / 100;
+  
+  // 4. Base EMI (Principal + Interest)
+  let baseEmi = 0;
   if (temp.interestType === 'Flat Rate') {
     const totalInterest = P * (rate / 100);
-    monthlyRepayment = (P + totalInterest) / N;
+    baseEmi = (P + totalInterest) / N;
   } else {
-    // Reducing Balance / Standard Compound EMI
     const monthlyRate = (rate / 100) / 12;
     if (monthlyRate === 0) {
-      monthlyRepayment = P / N;
+      baseEmi = P / N;
     } else {
-      monthlyRepayment = (P * monthlyRate * Math.pow(1 + monthlyRate, N)) / (Math.pow(1 + monthlyRate, N) - 1);
+      baseEmi = (P * monthlyRate * Math.pow(1 + monthlyRate, N)) / (Math.pow(1 + monthlyRate, N) - 1);
     }
   }
+  
+  // 5. Monthly EMI (EMI + Service Fee + Insurance / N)
+  const totalRepaymentBase = baseEmi * N + initiationFee + (monthlyServiceFee * N) + insuranceFee;
+  
+  // VAT on fees
+  const vatRate = Number(temp.vatPercentage || 15);
+  const vatOnFees = (initiationFee + (monthlyServiceFee * N)) * (vatRate / 100);
+  
+  const totalRepayment = totalRepaymentBase + vatOnFees;
+  const monthlyRepayment = totalRepayment / N;
 
-  // Formulate localized strings or numbers
+  // Formulate response matching frontend expectations
   const response = {
     monthlyRepayment: Math.round(monthlyRepayment),
     minPrincipal: temp.eligibleMinimumPrincipal || 1000,
@@ -177,7 +222,13 @@ const calculateLivePreview = asyncHandler(async (req, res) => {
       feeFrequency: 'Once per approved loan',
       penaltyBasis: temp.autoApplyLateFee ? 'Automated Overdue Run' : 'Manual Verification Trigger',
       reviewFlow: temp.enableAutoApprovalLogic ? 'Instant Automated Desk' : 'Manual Verification Gate'
-    }
+    },
+    // New NCR parameters
+    initiationFee: Math.round(initiationFee),
+    monthlyServiceFee: Math.round(monthlyServiceFee),
+    insuranceFee: Math.round(insuranceFee),
+    vatOnFees: Math.round(vatOnFees),
+    totalRepayment: Math.round(totalRepayment)
   };
 
   sendSuccess(res, 'Live preview calculated', response);
@@ -188,6 +239,7 @@ module.exports = {
   updateGeneralSettings,
   updateEligibilityRules,
   updateDocumentRules,
+  updateBulkSettings,
   resetSettings,
   calculateLivePreview
 };

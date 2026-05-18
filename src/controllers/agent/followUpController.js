@@ -65,12 +65,37 @@ const createFollowUp = asyncHandler(async (req, res) => {
     conversation.lastMessageAt = new Date();
     await conversation.save();
 
-    // Emit Socket event for real-time chat
+    // Emit Socket events for real-time chat and notifications
     const io = getIO();
     if (io) {
-      io.to(conversation._id.toString()).emit('new-followup-message', {
+      const roomId = conversation._id.toString();
+      const borrowerIdStr = loan.borrowerId.toString();
+
+      // 1. Emit to conversation room
+      io.to(roomId).emit('message-received', newMessage);
+      io.to(roomId).emit('message:received', newMessage);
+      io.to(roomId).emit('new-followup-message', {
         message: newMessage,
         conversationId: conversation._id
+      });
+
+      // 2. Direct events for borrower
+      io.to(borrowerIdStr).emit('message-notification', {
+        conversationId: conversation._id,
+        message: newMessage,
+        senderName: req.user.fullName
+      });
+
+      io.to(borrowerIdStr).emit('conversation-updated', {
+        conversationId: conversation._id,
+        lastMessage: notes,
+        lastMessageAt: new Date(),
+        unreadCount: (conversation.unreadCounts?.get(borrowerIdStr) || 0) + 1
+      });
+
+      io.to(borrowerIdStr).emit('new-notification', {
+        title: `Recovery Update: ${req.user.fullName}`,
+        message: notes.length > 50 ? notes.substring(0, 47) + '...' : notes
       });
     }
   }

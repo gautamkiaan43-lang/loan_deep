@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 const User = require('../../models/User');
 const Borrower = require('../../models/Borrower');
-const Loan = require('../../models/Loan');
+const ActiveLoan = require('../../models/ActiveLoan');
 const LoanApplication = require('../../models/LoanApplication');
 const Payment = require('../../models/Payment');
 const DuePayment = require('../../models/DuePayment');
@@ -37,26 +37,27 @@ const getDashboardOverview = asyncHandler(async (req, res) => {
   const borrowerGrowth = calculateGrowth(currMonthBorrowers, prevMonthBorrowers);
 
   // 2. Active Loans
-  const totalActiveLoans = await Loan.countDocuments({ status: 'active' });
-  const currActiveLoans = await Loan.countDocuments({ status: 'active', createdAt: { $gte: thisMonth.start, $lte: thisMonth.end } });
-  const prevActiveLoans = await Loan.countDocuments({ status: 'active', createdAt: { $gte: lastMonth.start, $lte: lastMonth.end } });
+  const totalActiveLoans = await ActiveLoan.countDocuments({ loanStatus: 'Active', isDeleted: false });
+  const currActiveLoans = await ActiveLoan.countDocuments({ loanStatus: 'Active', isDeleted: false, createdAt: { $gte: thisMonth.start, $lte: thisMonth.end } });
+  const prevActiveLoans = await ActiveLoan.countDocuments({ loanStatus: 'Active', isDeleted: false, createdAt: { $gte: lastMonth.start, $lte: lastMonth.end } });
   const loanGrowth = calculateGrowth(currActiveLoans, prevActiveLoans);
 
   // 3. Total Disbursed
-  const totalDisbursedAgg = await Loan.aggregate([
-    { $group: { _id: null, total: { $sum: '$loanAmount' } } }
+  const totalDisbursedAgg = await ActiveLoan.aggregate([
+    { $match: { isDeleted: false } },
+    { $group: { _id: null, total: { $sum: '$approvedAmount' } } }
   ]);
   const totalDisbursed = totalDisbursedAgg[0]?.total || 0;
 
-  const currDisbursedAgg = await Loan.aggregate([
-    { $match: { createdAt: { $gte: thisMonth.start, $lte: thisMonth.end } } },
-    { $group: { _id: null, total: { $sum: '$loanAmount' } } }
+  const currDisbursedAgg = await ActiveLoan.aggregate([
+    { $match: { isDeleted: false, createdAt: { $gte: thisMonth.start, $lte: thisMonth.end } } },
+    { $group: { _id: null, total: { $sum: '$approvedAmount' } } }
   ]);
   const currDisbursed = currDisbursedAgg[0]?.total || 0;
 
-  const prevDisbursedAgg = await Loan.aggregate([
-    { $match: { createdAt: { $gte: lastMonth.start, $lte: lastMonth.end } } },
-    { $group: { _id: null, total: { $sum: '$loanAmount' } } }
+  const prevDisbursedAgg = await ActiveLoan.aggregate([
+    { $match: { isDeleted: false, createdAt: { $gte: lastMonth.start, $lte: lastMonth.end } } },
+    { $group: { _id: null, total: { $sum: '$approvedAmount' } } }
   ]);
   const prevDisbursed = prevDisbursedAgg[0]?.total || 0;
   const disbursementGrowth = calculateGrowth(currDisbursed, prevDisbursed);
@@ -135,16 +136,17 @@ const getFinancialPerformance = asyncHandler(async (req, res) => {
   ]);
 
   // Disbursements: Approved loans
-  const monthlyDisbursements = await Loan.aggregate([
+  const monthlyDisbursements = await ActiveLoan.aggregate([
     {
       $match: {
+        isDeleted: false,
         createdAt: { $gte: startOfYear, $lte: endOfYear }
       }
     },
     {
       $group: {
         _id: { $month: '$createdAt' },
-        total: { $sum: '$loanAmount' }
+        total: { $sum: '$approvedAmount' }
       }
     }
   ]);
@@ -171,10 +173,10 @@ const getFinancialPerformance = asyncHandler(async (req, res) => {
  * @route   GET /api/admin/dashboard/operational-status
  */
 const getOperationalStatus = asyncHandler(async (req, res) => {
-  const newApplications = await LoanApplication.countDocuments({ status: 'New' });
-  const underReview = await LoanApplication.countDocuments({ status: 'Under Review' });
+  const newApplications = await LoanApplication.countDocuments({ status: { $in: ['New', 'Submitted'] } });
+  const underReview = await LoanApplication.countDocuments({ status: { $in: ['Under Review', 'Pending Review', 'Recommended'] } });
   const approvedLoans = await LoanApplication.countDocuments({ status: 'Approved' });
-  const activeLoans = await Loan.countDocuments({ status: 'active' });
+  const activeLoans = await ActiveLoan.countDocuments({ loanStatus: 'Active', isDeleted: false });
 
   sendSuccess(res, 'Operational counts loaded', {
     newApplications,
@@ -269,9 +271,9 @@ const getSystemHealth = asyncHandler(async (req, res) => {
  */
 const getRealtimeData = asyncHandler(async (req, res) => {
   // Package a light snapshot for Socket listeners
-  const newApplications = await LoanApplication.countDocuments({ status: 'New' });
+  const newApplications = await LoanApplication.countDocuments({ status: { $in: ['New', 'Submitted'] } });
   const pendingPayments = await Payment.countDocuments({ paymentStatus: 'Pending' });
-  const activeLoans = await Loan.countDocuments({ status: 'active' });
+  const activeLoans = await ActiveLoan.countDocuments({ loanStatus: 'Active', isDeleted: false });
 
   sendSuccess(res, 'Realtime snap', {
     newApplications,

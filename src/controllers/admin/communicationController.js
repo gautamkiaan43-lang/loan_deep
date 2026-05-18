@@ -40,7 +40,12 @@ const getAllConversations = asyncHandler(async (req, res) => {
   conversations.forEach(c => {
     const peer = c.participants.find(p => p._id.toString() !== req.user._id.toString());
     if (peer) {
-      conversationUserMap.set(peer._id.toString(), c);
+      const peerIdStr = peer._id.toString();
+      // Only set if not already present (since conversations are sorted by updatedAt: -1, 
+      // the first one we see is the most recent)
+      if (!conversationUserMap.has(peerIdStr)) {
+        conversationUserMap.set(peerIdStr, c);
+      }
     }
   });
 
@@ -81,11 +86,11 @@ const getSingleConversation = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
   let conversation;
-  
+
   // If id is a valid mongoose object id, look for conversation
   try {
     conversation = await Conversation.findById(id).populate('participants', 'fullName email role profilePhoto');
-  } catch (e) {}
+  } catch (e) { }
 
   if (!conversation) {
     // If id is a userId, find or create conversation between admin and user
@@ -121,7 +126,20 @@ const getSingleConversation = asyncHandler(async (req, res) => {
 const sendMessage = asyncHandler(async (req, res) => {
   const { conversationId, receiverId, messageType, messageText } = req.body;
 
-  let conversation = await Conversation.findById(conversationId);
+  let conversation;
+  
+  if (conversationId && conversationId.match(/^[0-9a-fA-F]{24}$/)) {
+    conversation = await Conversation.findById(conversationId);
+  }
+
+  if (!conversation && receiverId) {
+    // Look for existing conversation by participants to prevent duplicates
+    conversation = await Conversation.findOne({
+      participants: { $all: [req.user._id, receiverId] },
+      participantType: 'direct'
+    });
+  }
+
   if (!conversation) {
     conversation = await Conversation.create({
       participants: [req.user._id, receiverId],
@@ -146,9 +164,10 @@ const sendMessage = asyncHandler(async (req, res) => {
     const unreads = conversation.unreadCounts.get(receiverId.toString()) || 0;
     conversation.unreadCounts.set(receiverId.toString(), unreads + 1);
   }
-  
+
   conversation.lastMessage = messageText;
   conversation.lastMessageTime = new Date();
+  conversation.lastMessageAt = new Date();
   await conversation.save();
 
   await message.populate('senderId', 'fullName role profilePhoto');
@@ -178,12 +197,16 @@ const sendMessage = asyncHandler(async (req, res) => {
   try {
     const io = getIO();
     const roomId = conversationId.toString();
+    io.to(roomId).emit('message-received', message);
     io.to(roomId).emit('message:received', message);
     io.to(roomId).emit('receiveMessage', message);
     io.to(roomId).emit('receive_message', message);
+    
+    // Also emit to conversationId room (without .toString()) just in case
+    io.to(conversation._id.toString()).emit('message-received', message);
     // Also emit to user specific channel for notifications/sidebar updates
     io.emit(`receiveMessage_${receiverId}`, message);
-    
+
     // Unread count update for receiver
     const newUnread = (conversation.unreadCounts.get(receiverId.toString()) || 0);
     io.emit(`unread:updated_${receiverId}`, { conversationId, unreadCount: newUnread });
@@ -250,12 +273,14 @@ const broadcastMessage = asyncHandler(async (req, res) => {
     conversation.unreadCounts.set(user._id.toString(), unreads + 1);
     conversation.lastMessage = messageText;
     conversation.lastMessageTime = new Date();
+    conversation.lastMessageAt = new Date();
     await conversation.save();
 
     await message.populate('senderId', 'fullName role profilePhoto');
 
     const io = getIO();
     const roomId = conversation._id.toString();
+    io.to(roomId).emit('message-received', message);
     io.to(roomId).emit('message:received', message);
     io.to(roomId).emit('receive_message', message);
     io.emit(`receive_message_${user._id}`, message);
@@ -274,7 +299,7 @@ const broadcastMessage = asyncHandler(async (req, res) => {
         relatedModel: 'Conversation',
         priority: 'important'
       });
-    } catch (notifErr) {}
+    } catch (notifErr) { }
   }
 
   sendSuccess(res, 'Broadcast sent successfully');
@@ -356,9 +381,9 @@ const getUnreadCounts = asyncHandler(async (req, res) => {
  */
 const deleteMessage = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  
+
   const message = await Message.findById(id);
-  
+
   if (!message) {
     return sendError(res, 'Message not found', 404);
   }
@@ -368,9 +393,9 @@ const deleteMessage = asyncHandler(async (req, res) => {
 
   // Broadcast deletions via socket stream
   const io = getIO();
-  io.to(message.conversationId.toString()).emit('message_deleted', { 
-    conversationId: message.conversationId, 
-    messageId: message._id 
+  io.to(message.conversationId.toString()).emit('message_deleted', {
+    conversationId: message.conversationId,
+    messageId: message._id
   });
 
   sendSuccess(res, 'Message deleted successfully', { messageId: id });

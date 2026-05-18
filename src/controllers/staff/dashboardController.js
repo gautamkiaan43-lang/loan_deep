@@ -17,18 +17,13 @@ exports.getDashboardData = asyncHandler(async (req, res) => {
 
   // 1. ANALYTICS CARDS
   
-  // Pending Applications assigned to this staff
+  // Pending Applications - Include all that need staff attention
   const pendingApplicationsCount = await LoanApplication.countDocuments({
-    'staffReview.reviewedBy': staffId,
-    status: { $in: ['New', 'Pending Review', 'Under Review'] }
+    status: { $in: ['New', 'Submitted', 'Pending Review', 'Under Review', 'Pending Verification', 'Pending'] }
   });
 
-  // Pending Verifications (Payments for borrowers assigned to this staff)
-  // First find borrowers assigned to this staff
-  const assignedBorrowerIds = await Borrower.find({ assignedStaff: staffId }).distinct('_id');
-  
+  // Pending Verifications
   const pendingVerificationsCount = await Payment.countDocuments({
-    borrowerId: { $in: assignedBorrowerIds },
     paymentStatus: 'Pending'
   });
 
@@ -36,22 +31,26 @@ exports.getDashboardData = asyncHandler(async (req, res) => {
   const reviewedTodayCount = await LoanApplication.countDocuments({
     'staffReview.reviewedBy': staffId,
     'staffReview.verificationDate': { $gte: today },
-    status: { $in: ['Reviewed', 'Recommended'] }
+    status: { $in: ['Reviewed', 'Recommended', 'Approved', 'Rejected'] }
   });
 
-  // Recent Activities count (Using notifications as a proxy for operational actions)
-  // Or count applications that were moved out of 'New' or 'Under Review' today
+  // Recent Activities count
   const recentActivitiesCount = await LoanApplication.countDocuments({
-    'staffReview.reviewedBy': staffId,
     updatedAt: { $gte: today }
   }) + await Payment.countDocuments({
-    verifiedBy: staffId,
     updatedAt: { $gte: today }
   });
 
+  const threeDaysAgo = new Date();
+  threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+
   const workflowQueue = await LoanApplication.find({
-    'staffReview.reviewedBy': staffId,
-    status: { $in: ['New', 'Under Review', 'Pending Verification', 'Pending Review'] }
+    $or: [
+      { assignedReviewer: staffId, assignedAt: { $gte: threeDaysAgo } },
+      { status: { $in: ['New', 'Submitted'] }, assignedReviewer: { $exists: false }, createdAt: { $gte: threeDaysAgo } },
+      { status: { $in: ['New', 'Submitted'] }, assignedReviewer: null, createdAt: { $gte: threeDaysAgo } }
+    ],
+    status: { $in: ['New', 'Submitted', 'Under Review', 'Pending Review', 'Pending Verification', 'Pending'] }
   })
   .sort({ updatedAt: -1 })
   .limit(10)
@@ -66,13 +65,20 @@ exports.getDashboardData = asyncHandler(async (req, res) => {
     loanType: app.loanType || 'Personal Loan',
     loanAmount: app.requestedAmount,
     currentStatus: app.status,
-    assignedDate: app.updatedAt
+    assignedDate: app.assignedAt || app.updatedAt
   }));
 
-  // 2.5 VERIFICATIONS QUEUE (Payments pending verification for assigned borrowers)
+  // 2.5 VERIFICATIONS QUEUE (Payments pending verification - Recent 3 days)
+  // Find borrowers assigned to this staff
+  const assignedBorrowerIds = await Borrower.find({ assignedStaff: staffId }).distinct('_id');
+
   const pendingPayments = await Payment.find({
-    borrowerId: { $in: assignedBorrowerIds },
-    paymentStatus: 'Pending'
+    $or: [
+      { borrowerId: { $in: assignedBorrowerIds } },
+      { verifiedBy: staffId }
+    ],
+    paymentStatus: 'Pending',
+    createdAt: { $gte: threeDaysAgo }
   })
   .sort({ createdAt: -1 })
   .limit(10);

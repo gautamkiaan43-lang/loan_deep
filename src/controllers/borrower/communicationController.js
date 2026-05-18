@@ -9,6 +9,7 @@ const asyncHandler = require('../../utils/asyncHandler');
 const { sendSuccess, sendError } = require('../../utils/responseHandler');
 const { getIO } = require('../../socket/socketServer');
 const imagekit = require('../../config/imagekit');
+const { createNotification } = require('../../utils/notificationHelper');
 
 /**
  * @desc    Get all conversations for borrower
@@ -17,13 +18,16 @@ const imagekit = require('../../config/imagekit');
 exports.getConversations = asyncHandler(async (req, res) => {
   const userId = req.user._id;
 
+  // Only return direct 1:1 conversations (2 participants) to avoid group conversations
+  // created when staff is added to the borrower-admin thread
   const conversations = await Conversation.find({
     participants: userId,
     isActive: true,
-    isDeleted: false
+    isDeleted: false,
+    $expr: { $eq: [{ $size: '$participants' }, 2] }
   })
-  .populate('participants', 'fullName role profilePhoto email')
-  .sort({ updatedAt: -1 });
+    .populate('participants', 'fullName role profilePhoto email')
+    .sort({ updatedAt: -1 });
 
   // Build formatted list and deduplicate by chat partner
   // (conversations are sorted by updatedAt desc, so the first one per partner is the most recent)
@@ -107,11 +111,15 @@ exports.sendMessage = asyncHandler(async (req, res) => {
   }
 
   // Create message
+  const otherParticipant = conversation.participants.find(p => p.toString() !== userId.toString());
+  
   const newMessage = await Message.create({
     conversationId,
     senderId: userId,
     senderRole: userRole,
+    receiverId: otherParticipant,
     message,
+    messageText: message,
     messageType: messageType || (attachment ? 'file' : 'text'),
     attachment,
     attachmentName,
@@ -122,6 +130,7 @@ exports.sendMessage = asyncHandler(async (req, res) => {
   const updateData = {
     lastMessage: message || (attachment ? 'Sent an attachment' : ''),
     lastMessageAt: new Date(),
+    lastMessageTime: new Date(),
     updatedAt: new Date()
   };
 
@@ -141,9 +150,12 @@ exports.sendMessage = asyncHandler(async (req, res) => {
 
   // Emit socket events
   const io = getIO();
-  // 1. Send to the conversation room
+  // 1. Send to the conversation room (Multiple events for broad compatibility)
   io.to(conversationId).emit('message-received', populatedMessage);
-  
+  io.to(conversationId).emit('message:received', populatedMessage);
+  io.to(conversationId).emit('receiveMessage', populatedMessage);
+  io.to(conversationId).emit('receive_message', populatedMessage);
+
   // 2. Send notifications to other participants
   conversation.participants.forEach(async (participantId) => {
     if (participantId.toString() !== userId.toString()) {
@@ -162,21 +174,31 @@ exports.sendMessage = asyncHandler(async (req, res) => {
         unreadCount: updateData[`unreadCounts.${participantId}`]
       });
 
-      // Create persistence notification
-      await Notification.create({
-        receiverId: participantId,
-        receiverRole: 'borrower', // Simplified for now, should ideally check role
-        senderId: userId,
-        senderRole: userRole,
-        type: 'NewMessage',
-        title: `New message from ${req.user.fullName}`,
-        message: message || 'Sent an attachment',
-        relatedConversation: conversationId
-      });
-      
+      // Create persistence notification using helper for real-time broadcast
+      try {
+        const receiverUser = await User.findById(participantId);
+        if (receiverUser) {
+          await createNotification({
+            receiverId: participantId,
+            receiverRole: receiverUser.role,
+            senderId: userId,
+            senderRole: userRole,
+            type: 'NewMessage',
+            notificationType: 'NewMessage',
+            title: `New message from ${req.user.fullName}`,
+            message: message || (attachment ? 'Sent an attachment' : ''),
+            relatedConversation: conversationId,
+            priority: 'normal'
+          });
+        }
+      } catch (notifError) {
+        console.error('Failed to create notification:', notifError);
+      }
+
       io.to(participantId.toString()).emit('new-notification', {
         title: `New message from ${req.user.fullName}`,
-        message: message || 'Sent an attachment'
+        message: message || 'Sent an attachment',
+        conversationId
       });
     }
   });
@@ -225,7 +247,7 @@ exports.getNotifications = asyncHandler(async (req, res) => {
  */
 exports.markNotificationRead = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const notification = await Notification.findByIdAndUpdate(id, { 
+  const notification = await Notification.findByIdAndUpdate(id, {
     isRead: true,
     status: 'READ',
     readAt: new Date()
@@ -244,8 +266,8 @@ exports.getParticipants = asyncHandler(async (req, res) => {
 
   const participantMap = new Map();
 
-  // 1. Always include active admins
-  const admins = await User.find({ role: 'admin', isActive: true, isDeleted: false })
+  // 1. Always include admins — use $ne so documents without the field are also matched
+  const admins = await User.find({ role: 'admin', isActive: { $ne: false }, isDeleted: { $ne: true } })
     .select('fullName role email profilePhoto');
   admins.forEach(a => participantMap.set(a._id.toString(), a.toObject()));
 
@@ -264,10 +286,14 @@ exports.getParticipants = asyncHandler(async (req, res) => {
     }).populate('assignedAgentId assignedStaffId', 'fullName role email profilePhoto isActive isDeleted');
 
     assignments.forEach(a => {
-      if (a.assignedAgentId && a.assignedAgentId.isActive !== false && !a.assignedAgentId.isDeleted) {
+      // Agent: show if assigned to borrower's application
+      if (a.assignedAgentId &&
+        a.assignedAgentId.isActive !== false && !a.assignedAgentId.isDeleted) {
         participantMap.set(a.assignedAgentId._id.toString(), a.assignedAgentId.toObject());
       }
-      if (a.assignedStaffId && a.assignedStaffId.isActive !== false && !a.assignedStaffId.isDeleted) {
+      // Staff: include regardless of assignment type (admin always explicitly assigns staff)
+      if (a.assignedStaffId &&
+        a.assignedStaffId.isActive !== false && !a.assignedStaffId.isDeleted) {
         participantMap.set(a.assignedStaffId._id.toString(), a.assignedStaffId.toObject());
       }
     });
@@ -277,8 +303,8 @@ exports.getParticipants = asyncHandler(async (req, res) => {
     if (reviewerIds.length > 0) {
       const reviewers = await User.find({
         _id: { $in: reviewerIds },
-        isActive: true,
-        isDeleted: false
+        isActive: { $ne: false },
+        isDeleted: { $ne: true }
       }).select('fullName role email profilePhoto');
       reviewers.forEach(r => participantMap.set(r._id.toString(), r.toObject()));
     }
@@ -337,9 +363,12 @@ exports.startConversation = asyncHandler(async (req, res) => {
     }
   }
 
-  // 3. Reuse existing conversation if one already exists
+  // 3. Reuse existing DIRECT (2-person) conversation if one exists
+  // Using $size: 2 prevents accidentally finding the group conversation where staff
+  // was added to the borrower-admin thread via $addToSet during loan assignment
   let conversation = await Conversation.findOne({
     participants: { $all: [userId, participantId] },
+    $expr: { $eq: [{ $size: '$participants' }, 2] },
     isActive: true,
     isDeleted: false
   });
@@ -361,4 +390,48 @@ exports.startConversation = asyncHandler(async (req, res) => {
   convObj.chatPartner = populatedConv.participants.find(p => p._id.toString() !== userId.toString());
 
   sendSuccess(res, 'Conversation started', convObj);
+});
+
+/**
+ * @desc    Delete a single notification
+ * @route   DELETE /api/borrower/communications/notifications/:id
+ */
+exports.deleteNotification = asyncHandler(async (req, res) => {
+  const notification = await Notification.findOneAndUpdate(
+    { _id: req.params.id, receiverId: req.user._id },
+    { isDeleted: true },
+    { new: true }
+  );
+
+  if (!notification) {
+    return sendError(res, 'Notification not found or access denied', 404);
+  }
+
+  sendSuccess(res, 'Notification deleted successfully');
+});
+
+/**
+ * @desc    Clear all notifications for the borrower
+ * @route   DELETE /api/borrower/communications/notifications/clear-all
+ */
+exports.clearNotifications = asyncHandler(async (req, res) => {
+  await Notification.updateMany(
+    { receiverId: req.user._id, isDeleted: false },
+    { isDeleted: true }
+  );
+
+  sendSuccess(res, 'All notifications cleared successfully');
+});
+
+/**
+ * @desc    Mark all notifications as read for the borrower
+ * @route   PATCH /api/borrower/communications/notifications/read-all
+ */
+exports.markAllNotificationsRead = asyncHandler(async (req, res) => {
+  await Notification.updateMany(
+    { receiverId: req.user._id, isRead: false, isDeleted: false },
+    { isRead: true, status: 'READ' }
+  );
+
+  sendSuccess(res, 'All notifications marked as read');
 });

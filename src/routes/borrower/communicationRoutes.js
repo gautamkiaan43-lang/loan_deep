@@ -17,7 +17,10 @@ router.patch('/messages/read', communicationController.markRead);
 
 // Notification Routes
 router.get('/notifications', communicationController.getNotifications);
+router.patch('/notifications/read-all', communicationController.markAllNotificationsRead);
 router.patch('/notifications/:id/read', communicationController.markNotificationRead);
+router.delete('/notifications/clear-all', communicationController.clearNotifications);
+router.delete('/notifications/:id', communicationController.deleteNotification);
 
 // Participant Routes
 router.get('/participants', communicationController.getParticipants);

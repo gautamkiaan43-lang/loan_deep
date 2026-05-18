@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 const Borrower = require('../models/Borrower');
 const LoanApplication = require('../models/LoanApplication');
-const Loan = require('../models/Loan');
+const ActiveLoan = require('../models/ActiveLoan');
 const Payment = require('../models/Payment');
 const User = require('../models/User');
 const asyncHandler = require('../utils/asyncHandler');
@@ -149,6 +149,31 @@ exports.getAllBorrowers = asyncHandler(async (req, res) => {
 
   const borrowers = await Borrower.find(query).sort({ createdAt: -1 });
   
+  // Fetch active loans count for retrieved borrowers in a single efficient query, handling user/borrower ID mapping inconsistency
+  const borrowerIds = borrowers.map(b => b._id);
+  const userIds = borrowers.filter(b => b.userId).map(b => b.userId);
+  
+  const activeLoans = await ActiveLoan.find({ 
+    $or: [
+      { borrowerId: { $in: borrowerIds } },
+      { borrowerId: { $in: userIds } }
+    ],
+    loanStatus: { $in: ['Active', 'Overdue'] },
+    isDeleted: false 
+  });
+  
+  const borrowersWithLoans = borrowers.map(b => {
+    const activeLoansCount = activeLoans.filter(l => 
+      l.borrowerId.toString() === b._id.toString() || 
+      (b.userId && l.borrowerId.toString() === b.userId.toString())
+    ).length;
+    
+    return {
+      ...b.toObject(),
+      activeLoansCount
+    };
+  });
+  
   // Calculate stats
   const stats = {
     totalBorrowers: await Borrower.countDocuments(),
@@ -157,7 +182,7 @@ exports.getAllBorrowers = asyncHandler(async (req, res) => {
     frozenBorrowers: await Borrower.countDocuments({ accountStatus: 'Frozen' }),
   };
 
-  sendSuccess(res, 'Borrowers retrieved successfully', { borrowers, stats });
+  sendSuccess(res, 'Borrowers retrieved successfully', { borrowers: borrowersWithLoans, stats });
 });
 
 // @desc    Get single borrower
@@ -174,9 +199,15 @@ exports.getBorrowerById = asyncHandler(async (req, res, next) => {
 
   // Fetch Activity History (Applications, Loans, Payments)
   const [applications, loans, payments] = await Promise.all([
-    LoanApplication.find({ borrower: borrower._id }).sort({ createdAt: -1 }),
-    Loan.find({ borrower: borrower._id }).sort({ createdAt: -1 }),
-    Payment.find({ borrower: borrower._id }).sort({ createdAt: -1 }),
+    LoanApplication.find({ borrowerId: borrower.userId }).sort({ createdAt: -1 }),
+    ActiveLoan.find({ 
+      $or: [
+        { borrowerId: borrower._id },
+        { borrowerId: borrower.userId }
+      ],
+      isDeleted: false 
+    }).sort({ createdAt: -1 }),
+    Payment.find({ borrowerId: borrower._id, isDeleted: false }).sort({ createdAt: -1 }),
   ]);
 
   const activityHistory = [
@@ -184,24 +215,24 @@ exports.getBorrowerById = asyncHandler(async (req, res, next) => {
       type: 'Application',
       title: `Loan Application ${app.applicationId}`,
       date: app.createdAt,
-      amount: app.loanAmount,
+      amount: app.requestedAmount || app.loanAmount,
       status: app.status,
       iconType: 'FileText'
     })),
     ...loans.map(loan => ({
       type: 'Loan',
-      title: `Loan Approved ${loan.loanId}`,
-      date: loan.startDate || loan.createdAt,
-      amount: loan.principalAmount,
-      status: loan.status,
+      title: `Loan Approved ${loan.loanCode}`,
+      date: loan.approvedDate || loan.createdAt,
+      amount: loan.approvedAmount,
+      status: loan.loanStatus,
       iconType: 'CheckCircle'
     })),
     ...payments.map(pay => ({
       type: 'Payment',
       title: `EMI Payment ${pay.transactionId}`,
       date: pay.paymentDate,
-      amount: pay.amount,
-      status: pay.status,
+      amount: pay.paymentAmount,
+      status: pay.paymentStatus,
       iconType: 'Wallet'
     }))
   ].sort((a, b) => new Date(b.date) - new Date(a.date));

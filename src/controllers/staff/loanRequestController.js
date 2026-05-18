@@ -19,15 +19,22 @@ const getLoanRequestOverview = asyncHandler(async (req, res) => {
   const endOfToday = new Date();
   endOfToday.setHours(23, 59, 59, 999);
 
-  const newRequests = await LoanApplication.countDocuments({ status: 'New' });
+  const newRequests = await LoanApplication.countDocuments({ 
+    status: { $in: ['New', 'Submitted'] } 
+  });
   const pendingReviews = await LoanApplication.countDocuments({ 
-    status: { $in: ['Pending Review', 'Under Review'] } 
+    $or: [
+      { status: { $in: ['Pending Review', 'Under Review', 'Pending'] } },
+      { assignedReviewer: req.user._id }
+    ]
   });
   const pendingDocVerification = await LoanApplication.countDocuments({ 
-    uploadedDocsStatus: 'Pending' 
+    $or: [
+      { uploadedDocsStatus: 'Pending' },
+      { status: 'Pending Verification' }
+    ]
   });
   const reviewedToday = await LoanApplication.countDocuments({
-    status: 'Reviewed',
     'staffReview.reviewedBy': req.user._id,
     'staffReview.verificationDate': { $gte: startOfToday, $lte: endOfToday }
   });
@@ -86,7 +93,16 @@ const getLoanRequests = asyncHandler(async (req, res) => {
     loanType: app.loanType || 'General',
     requestedAmount: app.requestedAmount,
     uploadedDocsStatus: app.uploadedDocsStatus || 'Pending',
-    reviewStatus: app.status,
+    reviewStatus: app.reviewStatus === 'Pending' && app.staffReview?.recommendation && app.staffReview.recommendation !== 'Pending'
+      ? (app.staffReview.recommendation.includes('Reject') ? 'Rejected Recommendation' : 'Recommendation Submitted')
+      : app.reviewStatus,
+    applicationStatus: app.status,        // kept for reference
+    staffReview: app.staffReview?.verificationDate ? {
+      recommendation: app.staffReview.recommendation,
+      riskLevel: app.staffReview.riskLevel,
+      verificationNotes: app.staffReview.verificationNotes,
+      submittedAt: app.staffReview.verificationDate,
+    } : null,
     submittedDate: app.createdAt
   }));
 
@@ -244,7 +260,7 @@ const verifyDocuments = asyncHandler(async (req, res) => {
     const io = getIO();
     io.emit('loan-request:updated', { applicationId: app.applicationId, status: app.status });
     io.emit('document:verified', { applicationId: app.applicationId, type: documentType, status: verificationStatus });
-    io.emit('dashboard:update', { trigger: 'verification' });
+    io.emit('dashboard:updated', { trigger: 'verification' });
   } catch (err) {}
 
   sendSuccess(res, 'Document assessment committed successfully', app);
@@ -277,6 +293,16 @@ const submitReview = asyncHandler(async (req, res) => {
 
   // Update application status to Reviewed
   app.status = 'Reviewed';
+  
+  // Set explicit review status for tracking
+  if (recommendation.includes('Recommend') || recommendation === 'Recommended') {
+    app.reviewStatus = 'Recommendation Submitted';
+  } else if (recommendation === 'Rejected' || recommendation.includes('Rejection')) {
+    app.reviewStatus = 'Rejected Recommendation';
+  } else {
+    app.reviewStatus = 'Reviewed';
+  }
+  
   await app.save();
 
   // Create Global Admin Notifications
@@ -295,7 +321,7 @@ const submitReview = asyncHandler(async (req, res) => {
     const io = getIO();
     io.emit('review:submitted', { applicationId: app.applicationId, recommendation });
     io.emit('loan-request:updated', { applicationId: app.applicationId, status: 'Reviewed' });
-    io.emit('dashboard:update', { trigger: 'review_submission' });
+    io.emit('dashboard:updated', { trigger: 'review_submission' });
   } catch (err) {}
 
   sendSuccess(res, 'Staff credit assessment submitted', app);

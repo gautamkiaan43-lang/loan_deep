@@ -30,6 +30,30 @@ const notificationSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'LoanApplication'
   },
+  notificationType: {
+    type: String,
+    enum: [
+      'BORROWER_ALERT',
+      'DUE_REMINDER',
+      'LOAN_APPROVAL',
+      'PAYMENT_UPDATE',
+      'PAYMENT_RECEIVED',
+      'OVERDUE_WARNING',
+      'FOLLOWUP_REMINDER',
+      'DOCUMENT_REQUEST',
+      'ADMIN_ALERT',
+      'NewLoanRequest',
+      'ReviewAssigned',
+      'PaymentVerification',
+      'PaymentRejected',
+      'NewMessage',
+      'BorrowerReply',
+      'AdminMessage',
+      'OverdueAlert',
+      'LoanApproved',
+      'LoanRejected'
+    ]
+  },
   type: {
     type: String,
     enum: [

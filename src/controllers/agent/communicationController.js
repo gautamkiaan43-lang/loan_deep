@@ -23,9 +23,9 @@ const getConversations = asyncHandler(async (req, res) => {
   const assignedBorrowerIds = agentProfile?.assignedBorrowers || [];
 
   // 2. Fetch "Proper" Participants based on Fintech Rules
-  
+
   // A. Assigned Borrowers
-  const assignedBorrowers = await User.find({ 
+  const assignedBorrowers = await User.find({
     _id: { $in: assignedBorrowerIds },
     role: 'borrower'
   }).select('_id fullName email role profilePhoto status isActive');
@@ -54,37 +54,50 @@ const getConversations = asyncHandler(async (req, res) => {
   const conversations = await Conversation.find({
     participants: agentId
   })
-  .populate('participants', 'fullName email role profilePhoto status isActive')
-  .sort({ updatedAt: -1 });
+    .populate('participants', 'fullName email role profilePhoto status isActive')
+    .sort({ updatedAt: -1 });
 
   // 4. Merge into a unified list for the sidebar
   let potentialUsers = [];
-  if (!filter || filter === 'all' || filter === 'All') {
-    potentialUsers = [...assignedBorrowers, ...relatedStaff, ...adminSupport];
-  } else if (filter === 'borrower' || filter === 'Borrower') {
-    potentialUsers = assignedBorrowers;
-  } else if (filter === 'staff' || filter === 'Staff') {
-    potentialUsers = relatedStaff;
-  } else if (filter === 'admin' || filter === 'Admin') {
-    potentialUsers = adminSupport;
-  }
+  const rawPotential = (!filter || filter === 'all' || filter === 'All')
+    ? [...assignedBorrowers, ...relatedStaff, ...adminSupport]
+    : (filter === 'borrower' || filter === 'Borrower') ? assignedBorrowers
+      : (filter === 'staff' || filter === 'Staff') ? relatedStaff
+        : (filter === 'admin' || filter === 'Admin') ? adminSupport
+          : [];
+
+  // Deduplicate potential users by ID
+  const uniquePotentialMap = new Map();
+  rawPotential.forEach(u => uniquePotentialMap.set(u._id.toString(), u));
+  potentialUsers = Array.from(uniquePotentialMap.values());
 
   const existingConvMap = new Map();
   conversations.forEach(c => {
     const peer = c.participants.find(p => p._id.toString() !== agentId.toString());
     if (peer) {
-      existingConvMap.set(peer._id.toString(), c);
+      // Store the most recent conversation if multiple exist
+      const existing = existingConvMap.get(peer._id.toString());
+      if (!existing || new Date(c.updatedAt) > new Date(existing.updatedAt)) {
+        existingConvMap.set(peer._id.toString(), c);
+      }
     }
   });
 
   const unifiedList = [];
-  // First, add existing conversations that match the filter
+  const seenPeerIds = new Set();
+
+  // First, add existing conversations that match the filter (deduplicated by peer)
   conversations.forEach(conv => {
     const peer = conv.participants.find(p => p._id.toString() !== agentId.toString());
     if (peer) {
-      const isAllowed = potentialUsers.some(u => u._id.toString() === peer._id.toString());
+      const peerIdStr = peer._id.toString();
+      if (seenPeerIds.has(peerIdStr)) return;
+
+      const isAllowed = potentialUsers.some(u => u._id.toString() === peerIdStr);
       if (isAllowed) {
-        unifiedList.push(conv);
+        // Use the most recent conversation from our map
+        unifiedList.push(existingConvMap.get(peerIdStr));
+        seenPeerIds.add(peerIdStr);
       }
     }
   });
@@ -92,7 +105,7 @@ const getConversations = asyncHandler(async (req, res) => {
   // Then, add potential users who don't have a conversation yet (Virtual Conversations)
   potentialUsers.forEach(user => {
     const userIdStr = user._id.toString();
-    if (!existingConvMap.has(userIdStr)) {
+    if (!seenPeerIds.has(userIdStr)) {
       unifiedList.push({
         _id: user._id,
         id: user._id, // Support both _id and id
@@ -104,13 +117,16 @@ const getConversations = asyncHandler(async (req, res) => {
         lastMessage: 'No messages yet.',
         lastMessageTime: null
       });
+      seenPeerIds.add(userIdStr);
     }
   });
 
   // Sort: Active conversations first, then virtual ones
   unifiedList.sort((a, b) => {
-    const timeA = a.lastMessageTime ? new Date(a.lastMessageTime).getTime() : 0;
-    const timeB = b.lastMessageTime ? new Date(b.lastMessageTime).getTime() : 0;
+    const timeA = a.lastMessageTime ? new Date(a.lastMessageTime).getTime() :
+      a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    const timeB = b.lastMessageTime ? new Date(b.lastMessageTime).getTime() :
+      b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
     return timeB - timeA;
   });
 
@@ -166,7 +182,7 @@ const getConversation = asyncHandler(async (req, res) => {
   if (id.match(/^[0-9a-fA-F]{24}$/)) {
     conversation = await Conversation.findOne({ _id: id, participants: agentId })
       .populate('participants', 'fullName email role profilePhoto status isActive');
-    
+
     if (conversation) {
       const peer = conversation.participants.find(p => p._id.toString() !== agentId.toString());
       peerId = peer?._id;
@@ -237,7 +253,7 @@ const sendMessage = asyncHandler(async (req, res) => {
       participants: { $all: [agentId, peerId] },
       participantType: 'direct'
     });
-    
+
     if (!conversation) {
       conversation = await Conversation.create({
         participants: [agentId, peerId],
@@ -271,22 +287,41 @@ const sendMessage = asyncHandler(async (req, res) => {
   // Real-time broadcast
   const io = getIO();
   const roomId = conversation._id.toString();
-  
-  // Emit to the conversation room for active chat windows
+
+  // 1. Emit to the conversation room for active chat windows (Both standards)
+  io.to(roomId).emit('message-received', newMessage);
   io.to(roomId).emit('message:received', newMessage);
   io.to(roomId).emit('receiveMessage', newMessage);
   io.to(roomId).emit('receive_message', newMessage);
 
-  // Unread count update for receiver
+  // 2. Direct events for sidebar updates and notifications for receiver
+  // Use peerIdStr room (private user room)
+  io.to(peerIdStr).emit('message-notification', {
+    conversationId: conversation._id,
+    message: newMessage,
+    senderName: req.user.fullName
+  });
+
+  io.to(peerIdStr).emit('conversation-updated', {
+    conversationId: conversation._id,
+    lastMessage: message,
+    lastMessageAt: new Date(),
+    unreadCount: conversation.unreadCounts.get(peerIdStr) || 0
+  });
+
+  io.to(peerIdStr).emit('new-notification', {
+    title: `New message from ${req.user.fullName}`,
+    message: message.length > 50 ? message.substring(0, 47) + '...' : message
+  });
+
+  // Backward compatibility events
   io.emit(`unread:updated_${peerIdStr}`, { conversationId: conversation._id, unreadCount: (conversation.unreadCounts.get(peerIdStr) || 0) });
-  
-  // Direct events for sidebar updates and notifications
   io.emit(`receiveMessage_${peerIdStr}`, newMessage);
   io.emit(`receive_message_${peerIdStr}`, newMessage);
   io.emit(`receiveMessage_${agentId}`, newMessage);
   io.emit(`receive_message_${agentId}`, newMessage);
-  
-  // Notification for receiver
+
+  // Notification persistence for receiver
   try {
     const receiver = await User.findById(peerIdStr);
     if (receiver) {
@@ -302,7 +337,7 @@ const sendMessage = asyncHandler(async (req, res) => {
         relatedModel: 'Conversation'
       });
     }
-  } catch (err) {}
+  } catch (err) { }
 
   sendSuccess(res, 'Message sent', newMessage);
 });
@@ -332,7 +367,7 @@ const createReminder = asyncHandler(async (req, res) => {
 
   // 2. Create the reminder message
   const message = `Reminder: ${reminderMessage}. Follow-up scheduled for ${new Date(followUpDate).toLocaleDateString()}`;
-  
+
   const newMessage = await Message.create({
     conversationId: conversation._id,
     senderId: agentId,
@@ -366,7 +401,31 @@ const createReminder = asyncHandler(async (req, res) => {
 
   // 4. Socket broadcast
   const io = getIO();
-  io.to(conversation._id.toString()).emit('message:received', await newMessage.populate('senderId', 'fullName role profilePhoto'));
+  const populatedMsg = await newMessage.populate('senderId', 'fullName role profilePhoto');
+  const roomId = conversation._id.toString();
+
+  // 1. Emit to the conversation room
+  io.to(roomId).emit('message-received', populatedMsg);
+  io.to(roomId).emit('message:received', populatedMsg);
+
+  // 2. Direct events for receiver
+  io.to(peerId).emit('message-notification', {
+    conversationId: conversation._id,
+    message: populatedMsg,
+    senderName: req.user.fullName
+  });
+
+  io.to(peerId).emit('conversation-updated', {
+    conversationId: conversation._id,
+    lastMessage: message,
+    lastMessageAt: new Date(),
+    unreadCount: conversation.unreadCounts.get(peerId) || 0
+  });
+
+  io.to(peerId).emit('new-notification', {
+    title: 'Payment/Follow-up Reminder',
+    message: reminderMessage
+  });
 
   sendSuccess(res, 'Reminder sent and notification created');
 });
@@ -449,14 +508,34 @@ const searchConversations = asyncHandler(async (req, res) => {
     participants: { $in: userIds }
   }).populate('participants', 'fullName email role profilePhoto status isActive');
 
-  const existingPeerIds = conversations.map(c => 
+  const existingPeerIds = conversations.map(c =>
     c.participants.find(p => p._id.toString() !== agentId.toString())._id.toString()
   );
 
-  // 4. Create virtual conversations for users found in search but no conversation exists
-  const unifiedResults = [...conversations];
+  // 4. Merge results with deduplication
+  const unifiedResults = [];
+  const seenPeerIds = new Set();
+
+  // First, add existing conversations (keeping most recent if duplicates exist)
+  const sortedConversations = [...conversations].sort((a, b) =>
+    new Date(b.updatedAt) - new Date(a.updatedAt)
+  );
+
+  sortedConversations.forEach(c => {
+    const peer = c.participants.find(p => p._id.toString() !== agentId.toString());
+    if (peer) {
+      const peerIdStr = peer._id.toString();
+      if (!seenPeerIds.has(peerIdStr)) {
+        unifiedResults.push(c);
+        seenPeerIds.add(peerIdStr);
+      }
+    }
+  });
+
+  // Then, add virtual ones for users who don't have a conversation yet
   users.forEach(user => {
-    if (!existingPeerIds.includes(user._id.toString())) {
+    const userIdStr = user._id.toString();
+    if (!seenPeerIds.has(userIdStr)) {
       unifiedResults.push({
         _id: user._id,
         id: user._id,
@@ -467,6 +546,7 @@ const searchConversations = asyncHandler(async (req, res) => {
         lastMessage: 'No messages yet.',
         lastMessageTime: null
       });
+      seenPeerIds.add(userIdStr);
     }
   });
 

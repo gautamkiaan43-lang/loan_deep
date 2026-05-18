@@ -33,7 +33,7 @@ const getStaffConversations = asyncHandler(async (req, res) => {
   let formattedList = conversations.map(c => {
     // Identify the other party
     const otherParty = c.participants.find(p => p._id.toString() !== currentUserId) || req.user;
-    
+
     const unread = c.unreadCounts && typeof c.unreadCounts.get === 'function'
       ? (c.unreadCounts.get(currentUserId) || 0)
       : (c.unreadCounts && c.unreadCounts[currentUserId] || 0);
@@ -55,8 +55,8 @@ const getStaffConversations = asyncHandler(async (req, res) => {
   // Apply text keyword search across peer user name & last messages
   if (search) {
     const keyword = search.toLowerCase();
-    formattedList = formattedList.filter(item => 
-      item.participantName.toLowerCase().includes(keyword) || 
+    formattedList = formattedList.filter(item =>
+      item.participantName.toLowerCase().includes(keyword) ||
       item.lastMessage.toLowerCase().includes(keyword)
     );
   }
@@ -188,7 +188,7 @@ const createNewConversation = asyncHandler(async (req, res) => {
     conversation.lastMessage = initialMessage;
     conversation.lastMessageAt = new Date();
     conversation.lastMessageTime = new Date();
-    
+
     // Increment unread for peer
     const currentUnreads = conversation.unreadCounts.get(recipient._id.toString()) || 0;
     conversation.unreadCounts.set(recipient._id.toString(), currentUnreads + 1);
@@ -226,7 +226,7 @@ const createNewConversation = asyncHandler(async (req, res) => {
       io.emit(`receiveMessage_${recipient._id}`, savedMsg);
       io.to(conversation._id.toString()).emit('receiveMessage', savedMsg);
     }
-  } catch (socketErr) {}
+  } catch (socketErr) { }
 
   sendSuccess(res, 'Conversation workspace established', {
     conversationId: conversation._id,
@@ -315,12 +315,12 @@ const sendMessage = asyncHandler(async (req, res) => {
     io.to(roomId).emit('message:received', formattedMsg);
     io.to(roomId).emit('receiveMessage', formattedMsg);
     io.to(roomId).emit('receive_message', formattedMsg); // Compatibility
-    
+
     // Also broadcast to individual user channels for notifications/sidebar updates
     const receiverId = otherUserId.toString();
     io.emit(`receiveMessage_${receiverId}`, formattedMsg);
     io.emit(`receive_message_${receiverId}`, formattedMsg);
-    
+
     // Important: Also emit to the sender's own channel so they see it in their sidebar/other tabs
     io.emit(`receiveMessage_${req.user._id}`, formattedMsg);
 
@@ -332,7 +332,7 @@ const sendMessage = asyncHandler(async (req, res) => {
 
     // Dispatch general sync alert
     io.emit('conversationUpdated', { conversationId, lastMessage: conversation.lastMessage });
-  } catch (socketErr) {}
+  } catch (socketErr) { }
 
   // Create notification for receiver
   try {
@@ -379,9 +379,9 @@ const markConversationRead = asyncHandler(async (req, res) => {
   // Update matching incoming unread messages by marking current user in readBy array
   await Message.updateMany(
     { conversationId, senderId: { $ne: req.user._id }, readBy: { $ne: req.user._id } },
-    { 
+    {
       $addToSet: { readBy: req.user._id },
-      isRead: true 
+      isRead: true
     }
   );
 
@@ -389,7 +389,7 @@ const markConversationRead = asyncHandler(async (req, res) => {
   try {
     const io = getIO();
     io.to(conversationId).emit('unreadUpdated', { conversationId, userId: req.user._id, unreadCount: 0 });
-  } catch (socketErr) {}
+  } catch (socketErr) { }
 
   sendSuccess(res, 'Thread successfully cleared / read updated');
 });
@@ -419,11 +419,11 @@ const deleteMessage = asyncHandler(async (req, res) => {
   // Socket broadcast event to sync client views instantly
   try {
     const io = getIO();
-    io.to(message.conversationId.toString()).emit('message_deleted', { 
-      conversationId: message.conversationId, 
-      messageId: message._id 
+    io.to(message.conversationId.toString()).emit('message_deleted', {
+      conversationId: message.conversationId,
+      messageId: message._id
     });
-  } catch (err) {}
+  } catch (err) { }
 
   sendSuccess(res, 'Message redacted successfully', { messageId });
 });

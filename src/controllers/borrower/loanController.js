@@ -3,8 +3,24 @@ const RepaymentSchedule = require('../../models/RepaymentSchedule');
 const LoanActivity = require('../../models/LoanActivity');
 const LoanApplication = require('../../models/LoanApplication');
 const Borrower = require('../../models/Borrower');
+const SystemSettings = require('../../models/SystemSettings');
 const asyncHandler = require('../../utils/asyncHandler');
 const { sendSuccess, sendError } = require('../../utils/responseHandler');
+
+/**
+ * @desc    Get system eligibility settings for borrower
+ * @route   GET /api/borrower/eligibility-settings
+ * @access  Private/Borrower
+ */
+exports.getEligibilitySettings = asyncHandler(async (req, res) => {
+  let settings = await SystemSettings.findOne();
+  
+  if (!settings) {
+    settings = await SystemSettings.create({});
+  }
+
+  sendSuccess(res, 'Eligibility settings fetched', settings);
+});
 
 /**
  * @desc    Get all active loans for the logged-in borrower

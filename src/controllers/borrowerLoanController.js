@@ -19,32 +19,90 @@ const imagekit = require('../config/imagekit');
 // @desc    Get Loan Estimate
 // @route   GET /api/borrower/apply-loan/estimate
 // @access  Protected
+// @desc    Get Loan Estimate
+// @route   GET /api/borrower/apply-loan/estimate
+// @access  Protected
 exports.getLoanEstimate = asyncHandler(async (req, res, next) => {
-  const { amount, duration } = req.query;
+  const { amount, duration, loanType = 'Personal Loan' } = req.query;
 
   if (!amount || !duration) return sendError(res, 'Amount and duration required', 400);
 
   const settings = await SystemSettings.findOne();
-  const interestRate = settings ? settings.defaultInterestRate : 12.5;
-  const processingFeeValue = settings ? settings.processingFeeValue : 250;
-  const processingFeeType = settings ? settings.processingFeeType : 'Fixed Amount';
-
-  let processingFee = processingFeeValue;
-  if (processingFeeType === 'Percentage') {
-    processingFee = (amount * processingFeeValue) / 100;
+  
+  // Calculate dynamic parameters using central rules engine
+  const pAmount = Number(amount) || 0;
+  const pDuration = Number(duration) || 12;
+  
+  const defaultProducts = [
+    { name: 'Personal Loan', code: 'PL-001', minAmount: 1000, maxAmount: 50000, minTenure: 3, maxTenure: 24, defaultInterestRate: 12.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Payday Loan', code: 'PD-002', minAmount: 500, maxAmount: 5000, minTenure: 1, maxTenure: 3, defaultInterestRate: 15.0, interestType: 'Flat Rate', processingFeeEnabled: true, insuranceEnabled: false, vatEnabled: true },
+    { name: 'Business Loan', code: 'BL-003', minAmount: 10000, maxAmount: 250000, minTenure: 6, maxTenure: 60, defaultInterestRate: 10.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Debt Consolidation', code: 'DC-004', minAmount: 5000, maxAmount: 150000, minTenure: 12, maxTenure: 48, defaultInterestRate: 11.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Salary Advance', code: 'SA-005', minAmount: 200, maxAmount: 3000, minTenure: 1, maxTenure: 1, defaultInterestRate: 5.0, interestType: 'Flat Rate', processingFeeEnabled: false, insuranceEnabled: false, vatEnabled: true }
+  ];
+  
+  const activeProducts = settings?.loanProducts || defaultProducts;
+  const selectedProduct = activeProducts.find(p => p.name === loanType) || activeProducts[0];
+  
+  const interestRate = Number(selectedProduct.defaultInterestRate ?? 12.5);
+  
+  // 1. Calculate Initiation Fee
+  let initiationFee = 0;
+  if (selectedProduct.processingFeeEnabled !== false && pAmount > 0) {
+    const feeType = settings?.initiationFeeType || 'Percentage';
+    const feeValue = Number(settings?.initiationFeeValue ?? 10);
+    if (feeType === 'Percentage') {
+      initiationFee = (pAmount * feeValue) / 100;
+    } else {
+      initiationFee = feeValue;
+    }
   }
 
-  const totalInterest = (amount * (interestRate / 100) * (duration / 12));
-  const totalRepayment = parseFloat(amount) + totalInterest + processingFee;
-  const estimatedMonthlyEMI = totalRepayment / duration;
+  // 2. Monthly Service Fee
+  const serviceFeeRate = Number(settings?.monthlyServiceFee ?? 60);
+  const monthlyServiceFee = pAmount > 0 ? serviceFeeRate : 0;
+
+  // 3. Base EMI (Principal + Interest)
+  let baseEmi = 0;
+  if (selectedProduct.interestType === 'Flat Rate') {
+    const totalInterest = pAmount * (interestRate / 100);
+    baseEmi = (pAmount + totalInterest) / pDuration;
+  } else {
+    const monthlyRate = (interestRate / 100) / 12;
+    if (monthlyRate === 0) {
+      baseEmi = pAmount / pDuration;
+    } else {
+      baseEmi = (pAmount * monthlyRate * Math.pow(1 + monthlyRate, pDuration)) / (Math.pow(1 + monthlyRate, pDuration) - 1);
+    }
+  }
+
+  // 4. Credit Life Insurance
+  let creditLifeInsurance = 0;
+  if (selectedProduct.insuranceEnabled !== false && pAmount > 0) {
+    const insuranceRate = Number(settings?.creditLifeInsuranceRate ?? 1.2);
+    creditLifeInsurance = (pAmount * insuranceRate) / 100;
+  }
+
+  // 5. VAT on fees
+  let vatOnFees = 0;
+  if (selectedProduct.vatEnabled !== false && pAmount > 0) {
+    const vatRate = Number(settings?.vatPercentage ?? 15);
+    vatOnFees = (initiationFee + (monthlyServiceFee * pDuration)) * (vatRate / 100);
+  }
+
+  const totalRepayment = (baseEmi * pDuration) + initiationFee + (monthlyServiceFee * pDuration) + creditLifeInsurance + vatOnFees;
+  const estimatedMonthlyEMI = pDuration > 0 ? (totalRepayment / pDuration) : 0;
 
   sendSuccess(res, 'Loan estimate generated', {
     requestedAmount: amount,
-    processingFee,
+    processingFee: initiationFee,
     interestRate,
     estimatedMonthlyEMI,
     totalRepayment,
-    duration
+    duration,
+    creditLifeInsurance,
+    vatOnFees,
+    monthlyServiceFee: monthlyServiceFee * pDuration
   });
 });
 
@@ -103,21 +161,72 @@ exports.submitFullApplication = asyncHandler(async (req, res, next) => {
   }
 
   const settings = await SystemSettings.findOne();
-  const interestRate = settings ? settings.defaultInterestRate : 12.5;
-  const processingFeeValue = settings ? settings.processingFeeValue : 250;
-  const processingFeeType = settings ? settings.processingFeeType : 'Fixed Amount';
   
-  let processingFee = processingFeeValue;
-  if (processingFeeType === 'Percentage') {
-    processingFee = (banking.requestedLoanAmount * processingFeeValue) / 100;
-  }
-
   const amount = Number(banking.requestedLoanAmount);
   const duration = Number(banking.requestedDuration);
+  const loanType = banking.loanType || 'Personal Loan';
+  
+  const defaultProducts = [
+    { name: 'Personal Loan', code: 'PL-001', minAmount: 1000, maxAmount: 50000, minTenure: 3, maxTenure: 24, defaultInterestRate: 12.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Payday Loan', code: 'PD-002', minAmount: 500, maxAmount: 5000, minTenure: 1, maxTenure: 3, defaultInterestRate: 15.0, interestType: 'Flat Rate', processingFeeEnabled: true, insuranceEnabled: false, vatEnabled: true },
+    { name: 'Business Loan', code: 'BL-003', minAmount: 10000, maxAmount: 250000, minTenure: 6, maxTenure: 60, defaultInterestRate: 10.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Debt Consolidation', code: 'DC-004', minAmount: 5000, maxAmount: 150000, minTenure: 12, maxTenure: 48, defaultInterestRate: 11.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Salary Advance', code: 'SA-005', minAmount: 200, maxAmount: 3000, minTenure: 1, maxTenure: 1, defaultInterestRate: 5.0, interestType: 'Flat Rate', processingFeeEnabled: false, insuranceEnabled: false, vatEnabled: true }
+  ];
+  
+  const activeProducts = settings?.loanProducts || defaultProducts;
+  const selectedProduct = activeProducts.find(p => p.name === loanType) || activeProducts[0];
+  
+  const interestRate = Number(selectedProduct.defaultInterestRate ?? 12.5);
+  
+  // 1. Calculate Initiation Fee
+  let initiationFee = 0;
+  if (selectedProduct.processingFeeEnabled !== false && amount > 0) {
+    const feeType = settings?.initiationFeeType || 'Percentage';
+    const feeValue = Number(settings?.initiationFeeValue ?? 10);
+    if (feeType === 'Percentage') {
+      initiationFee = (amount * feeValue) / 100;
+    } else {
+      initiationFee = feeValue;
+    }
+  }
 
-  const totalInterest = (amount * (interestRate / 100) * (duration / 12));
-  const totalRepayment = amount + totalInterest + processingFee;
-  const estimatedMonthlyEMI = totalRepayment / duration;
+  // 2. Monthly Service Fee
+  const serviceFeeRate = Number(settings?.monthlyServiceFee ?? 60);
+  const monthlyServiceFee = amount > 0 ? serviceFeeRate : 0;
+
+  // 3. Base EMI (Principal + Interest)
+  let baseEmi = 0;
+  if (selectedProduct.interestType === 'Flat Rate') {
+    const totalInterest = amount * (interestRate / 100);
+    baseEmi = (amount + totalInterest) / duration;
+  } else {
+    const monthlyRate = (interestRate / 100) / 12;
+    if (monthlyRate === 0) {
+      baseEmi = amount / duration;
+    } else {
+      baseEmi = (amount * monthlyRate * Math.pow(1 + monthlyRate, duration)) / (Math.pow(1 + monthlyRate, duration) - 1);
+    }
+  }
+
+  // 4. Credit Life Insurance
+  let creditLifeInsurance = 0;
+  if (selectedProduct.insuranceEnabled !== false && amount > 0) {
+    const insuranceRate = Number(settings?.creditLifeInsuranceRate ?? 1.2);
+    creditLifeInsurance = (amount * insuranceRate) / 100;
+  }
+
+  // 5. VAT on fees
+  let vatOnFees = 0;
+  if (selectedProduct.vatEnabled !== false && amount > 0) {
+    const vatRate = Number(settings?.vatPercentage ?? 15);
+    vatOnFees = (initiationFee + (monthlyServiceFee * duration)) * (vatRate / 100);
+  }
+
+  const totalRepayment = (baseEmi * duration) + initiationFee + (monthlyServiceFee * duration) + creditLifeInsurance + vatOnFees;
+  const estimatedMonthlyEMI = duration > 0 ? (totalRepayment / duration) : 0;
+  
+  const processingFee = initiationFee;
 
   // Compute credit-risk readiness fields
   const REQUIRED_DOC_TYPES = ['ID Document', 'Payslip', 'Bank Statement', 'Proof Of Address'];

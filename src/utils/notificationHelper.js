@@ -20,7 +20,8 @@ const createNotification = async (data) => {
     // Standardize the type field
     const notificationData = {
       ...data,
-      type: data.type || data.notificationType, // Support both new and legacy
+      type: data.type || data.notificationType,
+      notificationType: data.notificationType || data.type,
       status: data.status || 'UNREAD',
       isRead: data.isRead || false,
       isDeleted: false

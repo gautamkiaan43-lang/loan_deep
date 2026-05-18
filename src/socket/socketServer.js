@@ -17,12 +17,12 @@ const initSocket = (server) => {
     try {
       const token = socket.handshake.auth.token || socket.handshake.headers.authorization;
       if (!token) return next(new Error('Authentication error'));
-      
+
       const decoded = jwt.verify(token.replace('Bearer ', ''), process.env.JWT_SECRET);
       const user = await User.findById(decoded.id).select('-password');
-      
+
       if (!user) return next(new Error('User not found'));
-      
+
       socket.user = user;
       next();
     } catch (error) {
@@ -34,7 +34,7 @@ const initSocket = (server) => {
     // Join a room named after the user's ID for targeted notifications
     socket.join(socket.user._id.toString());
     // console.log(`User joined personal room: ${socket.user._id}`);
-    
+
     // Broadcast user online status (Both original & explicit prompt names)
     socket.broadcast.emit('online_status', { userId: socket.user._id, status: 'online' });
     socket.broadcast.emit('userOnline', { userId: socket.user._id, role: socket.user.role, name: socket.user.fullName });

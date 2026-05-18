@@ -330,7 +330,7 @@ const verifyPayment = asyncHandler(async (req, res) => {
     }
     
     // General update for admin/staff
-    io.emit('dashboard:update', { trigger: 'payment_verified' });
+    io.emit('dashboard:updated', { trigger: 'payment_verified' });
     
   } catch (notifErr) {
     console.error('Notification dispatch error:', notifErr);
@@ -402,7 +402,7 @@ const rejectPayment = asyncHandler(async (req, res) => {
     const io = getIO();
     io.emit('payment:rejected', { paymentId: payment.transactionId, reason: rejectionReason });
     io.emit('payment:updated', { paymentId: payment.transactionId, status: 'Rejected' });
-    io.emit('dashboard:update', { trigger: 'payment_rejected' });
+    io.emit('dashboard:updated', { trigger: 'payment_rejected' });
   } catch (err) {}
 
   sendSuccess(res, 'Payment proof rejected successfully', { payment });

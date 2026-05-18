@@ -57,7 +57,7 @@ const loanApplicationSchema = new mongoose.Schema(
     
     reviewStatus: {
       type: String,
-      enum: ['Pending', 'Under Review', 'Recommendation Submitted', 'Rejected Recommendation', 'Reviewed', 'Pending Review'],
+      enum: ['Pending', 'Under Review', 'Recommendation Submitted', 'Rejected Recommendation', 'Reviewed', 'Pending Review', 'Approved', 'Rejected', 'Hold'],
       default: 'Pending'
     },
 

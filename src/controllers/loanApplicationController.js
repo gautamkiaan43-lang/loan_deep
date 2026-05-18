@@ -42,7 +42,15 @@ const getAllApplications = asyncHandler(async (req, res) => {
 
   // Filter by status
   if (status) {
-    query.status = status;
+    if (status === 'New') {
+      query.status = { $in: ['New', 'Submitted'] };
+    } else if (status === 'Under Review') {
+      query.status = { $in: ['Under Review', 'Pending Review', 'Reviewed'] };
+    } else if (status === 'Approved') {
+      query.status = { $in: ['Approved', 'Disbursed'] };
+    } else {
+      query.status = status;
+    }
   }
 
   // Filter by staff reviewer
@@ -102,6 +110,9 @@ const getAllApplications = asyncHandler(async (req, res) => {
       estimatedEMI: app.estimatedMonthlyEMI,
       staffReviewer: app.staffReview?.staffName ? { fullName: app.staffReview.staffName } : null,
       status: app.status,
+      reviewStatus: app.reviewStatus === 'Pending' && app.staffReview?.recommendation && app.staffReview.recommendation !== 'Pending'
+        ? (app.staffReview.recommendation.includes('Reject') ? 'Rejected Recommendation' : 'Recommendation Submitted')
+        : app.reviewStatus,
       submittedDate: app.createdAt,
       // Full staff review details for admin visibility
       staffReview: app.staffReview?.verificationDate ? {
@@ -153,8 +164,17 @@ const getApplicationStats = asyncHandler(async (req, res) => {
   };
 
   stats.forEach(stat => {
-    if (formattedStats[stat._id] !== undefined) {
-      formattedStats[stat._id] = stat.count;
+    const status = stat._id;
+    const count = stat.count;
+
+    if (['New', 'Submitted'].includes(status)) {
+      formattedStats.New += count;
+    } else if (['Under Review', 'Pending Review', 'Reviewed'].includes(status)) {
+      formattedStats['Under Review'] += count;
+    } else if (['Approved', 'Disbursed'].includes(status)) {
+      formattedStats.Approved += count;
+    } else if (formattedStats[status] !== undefined) {
+      formattedStats[status] += count;
     }
   });
 
@@ -221,6 +241,9 @@ const getApplicationDetails = asyncHandler(async (req, res) => {
       profilePhoto: photoUrl ? { url: photoUrl } : null,
       borrowerId: borrowerProfile?.borrowerCode || null,
     },
+    reviewStatus: application.reviewStatus === 'Pending' && application.staffReview?.recommendation && application.staffReview.recommendation !== 'Pending'
+      ? (application.staffReview.recommendation.includes('Reject') ? 'Rejected Recommendation' : 'Recommendation Submitted')
+      : application.reviewStatus,
   };
 
   sendSuccess(res, 'Loan application details fetched successfully', fullApplication);
@@ -239,7 +262,7 @@ const approveApplication = asyncHandler(async (req, res) => {
     interestOverride 
   } = req.body;
 
-  const application = await LoanApplication.findById(req.params.id);
+  let application = await LoanApplication.findById(req.params.id);
 
   if (!application) {
     return sendError(res, 'Loan application not found', 404);
@@ -268,8 +291,18 @@ const approveApplication = asyncHandler(async (req, res) => {
   session.startTransaction();
 
   try {
+    // Re-fetch inside session for consistency
+    application = await LoanApplication.findById(req.params.id).session(session);
+
+    if (!application) {
+      await session.abortTransaction();
+      session.endSession();
+      return sendError(res, 'Loan application not found', 404);
+    }
+
     // Update application status
     application.status = 'Approved';
+    application.reviewStatus = 'Approved'; // Ensure it leaves the review queue
     application.adminDecision = {
       decision: 'Approved',
       adminNotes,
@@ -487,6 +520,7 @@ const rejectApplication = asyncHandler(async (req, res) => {
   }
 
   application.status = 'Rejected';
+  application.reviewStatus = 'Rejected';
   application.adminDecision = {
     decision: 'Rejected',
     rejectionReason,
@@ -558,6 +592,7 @@ const holdApplication = asyncHandler(async (req, res) => {
   }
 
   application.status = 'Hold';
+  application.reviewStatus = 'Hold';
   application.adminDecision = {
     decision: 'Hold',
     holdReason,
@@ -745,14 +780,9 @@ const assignReviewer = asyncHandler(async (req, res) => {
       relatedModel: 'LoanApplication'
     });
 
-    // E. Communication Thread (Check/Add Staff to conversation)
-    if (application.conversationId) {
-      await Conversation.findByIdAndUpdate(
-        application.conversationId,
-        { $addToSet: { participants: staffId } },
-        { session }
-      );
-    }
+    // E. Each party gets their own direct 1:1 conversation with the borrower.
+    // Do NOT add staff to the borrower-admin thread — that would create a group chat
+    // and cause startConversation to return the wrong conversation for each party.
 
     await session.commitTransaction();
     session.endSession();
@@ -763,11 +793,313 @@ const assignReviewer = asyncHandler(async (req, res) => {
     if (io) {
       io.emit('admin:loanAssigned', { applicationId: application._id, staffName: staffUser.fullName });
       io.to(staffId.toString()).emit('staff:newReviewTask', { applicationId: application._id });
+      io.to(staffId.toString()).emit('review:assigned', { applicationId: application._id });
       io.to(application.borrowerId.toString()).emit('borrower:statusUpdated', { status: 'Under Review' });
+      io.to(application.borrowerId.toString()).emit('dashboard:updated');
     }
 
     sendSuccess(res, 'Reviewer assigned successfully', { application });
   } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    throw error;
+  }
+});
+
+/**
+ * @desc    Delete loan application
+ * @route   DELETE /api/admin/loan-applications/:id
+ * @access  Private/Admin
+ */
+const deleteApplication = asyncHandler(async (req, res) => {
+  const application = await LoanApplication.findById(req.params.id);
+
+  if (!application) {
+    return sendError(res, 'Loan application not found', 404);
+  }
+
+  // Business Rule: Don't allow deleting approved/active loans from here
+  if (application.status === 'Approved' || application.status === 'Disbursed') {
+    return sendError(res, 'Approved or Disbursed applications cannot be deleted. Please close the loan instead.', 400);
+  }
+
+  await application.deleteOne();
+
+  sendSuccess(res, 'Loan application deleted successfully');
+});
+
+/**
+ * @desc    Create loan application on behalf of borrower (Admin & Staff)
+ * @route   POST /api/admin/loan-applications/create-on-behalf
+ * @access  Private (Admin/Staff)
+ */
+const createApplicationOnBehalf = asyncHandler(async (req, res) => {
+  const {
+    borrowerId,
+    personal,
+    employment,
+    banking,
+    documents,
+    confirmationAccepted,
+    creditConsentAccepted,
+    creditConsentAcceptedAt,
+  } = req.body;
+
+  if (!borrowerId) return sendError(res, 'Borrower ID is required', 400);
+  if (!confirmationAccepted) return sendError(res, 'Please accept confirmation', 400);
+  if (!creditConsentAccepted) return sendError(res, 'Credit check consent is required', 400);
+
+  if (!personal || !employment || !banking) {
+    return sendError(res, 'Missing required information blocks', 400);
+  }
+
+  // Unique ID Check
+  const existingApp = await LoanApplication.findOne({ idNumber: personal.idNumber, status: { $ne: 'Rejected' } });
+  if (existingApp) {
+    return sendError(res, 'An active application with this ID Number already exists', 400);
+  }
+
+  const SystemSettings = require('../models/SystemSettings');
+  const LoanEmployment = require('../models/LoanEmployment');
+  const LoanBanking = require('../models/LoanBanking');
+  const LoanDocument = require('../models/LoanDocument');
+  const LoanStatusHistory = require('../models/LoanStatusHistory');
+  const LoanAssignment = require('../models/LoanAssignment');
+  const Conversation = require('../models/Conversation');
+  const Notification = require('../models/Notification');
+
+  const settings = await SystemSettings.findOne();
+  
+  const amount = Number(banking.requestedLoanAmount);
+  const duration = Number(banking.requestedDuration);
+  const loanType = banking.loanType || 'Personal Loan';
+  
+  const defaultProducts = [
+    { name: 'Personal Loan', code: 'PL-001', minAmount: 1000, maxAmount: 50000, minTenure: 3, maxTenure: 24, defaultInterestRate: 12.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Payday Loan', code: 'PD-002', minAmount: 500, maxAmount: 5000, minTenure: 1, maxTenure: 3, defaultInterestRate: 15.0, interestType: 'Flat Rate', processingFeeEnabled: true, insuranceEnabled: false, vatEnabled: true },
+    { name: 'Business Loan', code: 'BL-003', minAmount: 10000, maxAmount: 250000, minTenure: 6, maxTenure: 60, defaultInterestRate: 10.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Debt Consolidation', code: 'DC-004', minAmount: 5000, maxAmount: 150000, minTenure: 12, maxTenure: 48, defaultInterestRate: 11.5, interestType: 'Reducing Balance', processingFeeEnabled: true, insuranceEnabled: true, vatEnabled: true },
+    { name: 'Salary Advance', code: 'SA-005', minAmount: 200, maxAmount: 3000, minTenure: 1, maxTenure: 1, defaultInterestRate: 5.0, interestType: 'Flat Rate', processingFeeEnabled: false, insuranceEnabled: false, vatEnabled: true }
+  ];
+  
+  const activeProducts = settings?.loanProducts || defaultProducts;
+  const selectedProduct = activeProducts.find(p => p.name === loanType) || activeProducts[0];
+  
+  const interestRate = Number(selectedProduct.defaultInterestRate ?? 12.5);
+  
+  // 1. Calculate Initiation Fee
+  let initiationFee = 0;
+  if (selectedProduct.processingFeeEnabled !== false && amount > 0) {
+    const feeType = settings?.initiationFeeType || 'Percentage';
+    const feeValue = Number(settings?.initiationFeeValue ?? 10);
+    if (feeType === 'Percentage') {
+      initiationFee = (amount * feeValue) / 100;
+    } else {
+      initiationFee = feeValue;
+    }
+  }
+
+  // 2. Monthly Service Fee
+  const serviceFeeRate = Number(settings?.monthlyServiceFee ?? 60);
+  const monthlyServiceFee = amount > 0 ? serviceFeeRate : 0;
+
+  // 3. Base EMI (Principal + Interest)
+  let baseEmi = 0;
+  if (selectedProduct.interestType === 'Flat Rate') {
+    const totalInterest = amount * (interestRate / 100);
+    baseEmi = (amount + totalInterest) / duration;
+  } else {
+    const monthlyRate = (interestRate / 100) / 12;
+    if (monthlyRate === 0) {
+      baseEmi = amount / duration;
+    } else {
+      baseEmi = (amount * monthlyRate * Math.pow(1 + monthlyRate, duration)) / (Math.pow(1 + monthlyRate, duration) - 1);
+    }
+  }
+
+  // 4. Credit Life Insurance
+  let creditLifeInsurance = 0;
+  if (selectedProduct.insuranceEnabled !== false && amount > 0) {
+    const insuranceRate = Number(settings?.creditLifeInsuranceRate ?? 1.2);
+    creditLifeInsurance = (amount * insuranceRate) / 100;
+  }
+
+  // 5. VAT on fees
+  let vatOnFees = 0;
+  if (selectedProduct.vatEnabled !== false && amount > 0) {
+    const vatRate = Number(settings?.vatPercentage ?? 15);
+    vatOnFees = (initiationFee + (monthlyServiceFee * duration)) * (vatRate / 100);
+  }
+
+  const totalRepayment = (baseEmi * duration) + initiationFee + (monthlyServiceFee * duration) + creditLifeInsurance + vatOnFees;
+  const estimatedMonthlyEMI = duration > 0 ? (totalRepayment / duration) : 0;
+  
+  const processingFee = initiationFee;
+
+  // Compute credit-risk readiness fields
+  const REQUIRED_DOC_TYPES = ['ID Document', 'Payslip', 'Bank Statement', 'Proof Of Address'];
+  const submittedDocTypes = (documents || []).map(d => d.type);
+  const allDocsPresent = REQUIRED_DOC_TYPES.every(t => submittedDocTypes.includes(t));
+
+  const documentVerificationStatus = allDocsPresent ? 'Complete' : submittedDocTypes.length > 0 ? 'Incomplete' : 'Pending';
+  const creditRiskReady = allDocsPresent && !!creditConsentAccepted;
+  let applicationAuditStatus = 'Incomplete';
+  if (creditRiskReady) applicationAuditStatus = 'Ready For Review';
+  else if (!allDocsPresent) applicationAuditStatus = 'Missing Documents';
+  else if (!creditConsentAccepted) applicationAuditStatus = 'Credit Consent Missing';
+
+  // --- START TRANSACTION ---
+  const mongoose = require('mongoose');
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // 1. Create Loan Application Record
+    const [application] = await LoanApplication.create([{
+      borrowerId: borrowerId,
+      fullName: personal.fullName,
+      phoneNumber: personal.phoneNumber,
+      emailAddress: personal.emailAddress,
+      idNumber: personal.idNumber,
+      dateOfBirth: personal.dateOfBirth,
+      residentialAddress: personal.residentialAddress,
+      requestedAmount: amount,
+      requestedDuration: duration,
+      processingFee,
+      interestRate,
+      estimatedMonthlyEMI,
+      totalRepayment,
+      status: 'Submitted',
+      confirmationAccepted: true,
+      submittedAt: new Date(),
+      creditConsentAccepted: true,
+      creditConsentAcceptedAt: creditConsentAcceptedAt ? new Date(creditConsentAcceptedAt) : new Date(),
+      documentVerificationStatus,
+      creditRiskReady,
+      applicationAuditStatus,
+    }], { session });
+
+    // 2. Create Related Records
+    await LoanEmployment.create([{
+      loanApplicationId: application._id,
+      ...employment
+    }], { session });
+
+    await LoanBanking.create([{
+      loanApplicationId: application._id,
+      ...banking
+    }], { session });
+
+    if (documents && documents.length > 0) {
+      const docRecords = documents.map(doc => ({
+        loanApplicationId: application._id,
+        documentType: doc.type,
+        fileUrl: doc.fileUrl || doc.url || doc.fileURL || (doc.data && doc.data.url),
+        fileId: doc.fileId || (doc.data && doc.data.fileId),
+        fileName: doc.fileName || (doc.data && doc.data.fileName),
+        fileSize: doc.fileSize || (doc.data && doc.data.fileSize)
+      }));
+      await LoanDocument.insertMany(docRecords, { session });
+    }
+
+    await LoanStatusHistory.create([{
+      loanApplicationId: application._id,
+      status: 'Submitted',
+      notes: `Loan application submitted on behalf of borrower by ${req.user.role} ${req.user.fullName || req.user.name || ''}`,
+      changedBy: req.user._id
+    }], { session });
+
+    // 3. Communications & Notifications
+    const admin = await User.findOne({ role: 'admin' });
+    
+    let io;
+    try { io = getIO(); } catch (e) {}
+
+    // Find the borrower User account so we can get their userId
+    const borrowerUser = await User.findById(borrowerId);
+
+    if (admin && borrowerUser) {
+      // Reuse existing borrower↔admin conversation to avoid duplicates
+      let existingConv = await Conversation.findOne({
+        participants: { $all: [borrowerId, admin._id] },
+        isActive: true,
+        isDeleted: false
+      }).session(session);
+
+      let conversation;
+      if (existingConv) {
+        await Conversation.findByIdAndUpdate(
+          existingConv._id,
+          { lastMessage: 'New loan application submitted', lastMessageAt: new Date() },
+          { session }
+        );
+        conversation = [existingConv];
+      } else {
+        conversation = await Conversation.create([{
+          participants: [borrowerId, admin._id],
+          participantRoles: ['borrower', 'admin'],
+          conversationType: 'Borrower',
+          lastMessage: 'New loan application submitted',
+          lastMessageAt: new Date()
+        }], { session });
+      }
+
+      application.conversationId = conversation[0]._id;
+      await application.save({ session });
+
+      await Notification.create([{
+        receiverId: admin._id,
+        receiverRole: 'admin',
+        senderId: req.user._id,
+        senderRole: req.user.role,
+        loanApplicationId: application._id,
+        type: 'NewLoanRequest',
+        title: 'New Loan Application',
+        message: `New application ${application.applicationId} received from ${application.fullName} (Created by ${req.user.role})`,
+        priority: 'IMPORTANT'
+      }], { session });
+    }
+
+    // 4. Auto Assignment
+    if (settings && settings.enableAutoAssignment) {
+      const agents = await User.find({ role: 'agent', isActive: true });
+      if (agents.length > 0) {
+        const assignedAgent = agents[Math.floor(Math.random() * agents.length)];
+        await LoanAssignment.create([{
+          loanApplicationId: application._id,
+          assignedAgentId: assignedAgent._id,
+          assignmentType: 'Auto'
+        }], { session });
+      }
+
+      const staffMembers = await User.find({ role: 'staff', isActive: true });
+      if (staffMembers.length > 0) {
+        const assignedStaff = staffMembers[Math.floor(Math.random() * staffMembers.length)];
+        await LoanAssignment.findOneAndUpdate(
+          { loanApplicationId: application._id },
+          { assignedStaffId: assignedStaff._id },
+          { upsert: true, session }
+        );
+      }
+    }
+
+    // --- COMMIT TRANSACTION ---
+    await session.commitTransaction();
+    session.endSession();
+
+    // Trigger Real-time (After commit)
+    if (io && admin) {
+      io.to(admin._id.toString()).emit('newNotification', { 
+        title: 'New Loan Application', 
+        message: `New application: ${application.applicationId}` 
+      });
+      io.emit('loan-request:new', { applicationId: application._id });
+    }
+
+    sendSuccess(res, 'Application submitted successfully on behalf of borrower', { application });
+
+  } catch (error) {
+    // --- ROLLBACK TRANSACTION ---
     await session.abortTransaction();
     session.endSession();
     throw error;
@@ -782,5 +1114,7 @@ module.exports = {
   rejectApplication,
   holdApplication,
   updateStaffReview,
-  assignReviewer
+  assignReviewer,
+  deleteApplication,
+  createApplicationOnBehalf
 };
