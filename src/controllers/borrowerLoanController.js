@@ -127,6 +127,56 @@ exports.uploadOnly = asyncHandler(async (req, res, next) => {
   });
 });
 
+// @desc    Create minimal Draft LoanApplication before verification steps begin
+// @route   POST /api/borrower/apply-loan/create-draft
+// @access  Protected
+exports.createDraftApplication = asyncHandler(async (req, res, next) => {
+  const { idNumber, fullName, phoneNumber, emailAddress, dateOfBirth, residentialAddress } = req.body;
+
+  if (!idNumber) return sendError(res, 'idNumber is required', 400);
+
+  // Return existing draft for this borrower + idNumber without creating a duplicate
+  const existing = await LoanApplication.findOne({
+    borrowerId: req.user._id,
+    idNumber,
+    status: 'Draft',
+  });
+
+  if (existing) {
+    console.log(`[APPLICATION] Using existing draft: ${existing._id}`);
+    return sendSuccess(res, 'Existing draft found', {
+      applicationId: existing._id,
+      applicationRef: existing.applicationId,
+    });
+  }
+
+  // Block if there is already a live (non-Draft, non-Rejected) application
+  const conflict = await LoanApplication.findOne({
+    idNumber,
+    status: { $nin: ['Rejected', 'Draft'] },
+  });
+  if (conflict) {
+    return sendError(res, 'An active application with this ID Number already exists', 400);
+  }
+
+  const draft = await LoanApplication.create({
+    borrowerId:          req.user._id,
+    fullName:            fullName            || 'Draft',
+    idNumber,
+    phoneNumber:         phoneNumber         || '0000000000',
+    emailAddress:        emailAddress        || req.user.email || 'draft@pending.com',
+    dateOfBirth:         dateOfBirth         ? new Date(dateOfBirth) : new Date('1990-01-01'),
+    residentialAddress:  residentialAddress  || 'Draft Address',
+    status:              'Draft',
+  });
+
+  console.log(`[APPLICATION] Draft created: ${draft._id}`);
+  return sendSuccess(res, 'Draft application created', {
+    applicationId: draft._id,
+    applicationRef: draft.applicationId,
+  });
+});
+
 // @desc    Submit Complete Loan Application (Atomic Transaction)
 // @route   POST /api/borrower/apply-loan/submit-full
 // @access  Protected
@@ -148,14 +198,36 @@ exports.submitFullApplication = asyncHandler(async (req, res, next) => {
     return sendError(res, 'Missing required information blocks', 400);
   }
 
+  // --- Dynamic Centralized Rules Validation ---
+  const { getValidationRules } = require('../services/validationRules.service');
+  const { validateLoanApplicationData } = require('../utils/loanValidationEngine');
+
+  const rules = await getValidationRules();
+  const validationResult = validateLoanApplicationData({
+    dob: personal.dateOfBirth || personal.dob,
+    monthlyIncome: employment.monthlyIncome,
+    employmentDuration: employment.employmentDuration,
+    requestedLoanAmount: banking.requestedLoanAmount,
+    requestedDuration: banking.requestedDuration,
+    employmentStatus: employment.employmentStatus,
+    documents: documents || []
+  }, rules);
+
+  if (!validationResult.isValid) {
+    return res.status(400).json({
+      success: false,
+      validationErrors: validationResult.errors
+    });
+  }
+
   // South Africa Phone Format
   const saPhoneRegex = /^0\d{9}$/;
   if (!saPhoneRegex.test(personal.phoneNumber)) {
     return sendError(res, 'Invalid South Africa phone format', 400);
   }
 
-  // Unique ID Check
-  const existingApp = await LoanApplication.findOne({ idNumber: personal.idNumber, status: { $ne: 'Rejected' } });
+  // Unique ID Check — exclude Draft status so pre-created drafts don't block submission
+  const existingApp = await LoanApplication.findOne({ idNumber: personal.idNumber, status: { $nin: ['Rejected', 'Draft'] } });
   if (existingApp) {
     return sendError(res, 'An active application with this ID Number already exists', 400);
   }

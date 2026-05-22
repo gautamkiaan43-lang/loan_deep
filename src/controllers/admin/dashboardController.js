@@ -175,7 +175,7 @@ const getFinancialPerformance = asyncHandler(async (req, res) => {
 const getOperationalStatus = asyncHandler(async (req, res) => {
   const newApplications = await LoanApplication.countDocuments({ status: { $in: ['New', 'Submitted'] } });
   const underReview = await LoanApplication.countDocuments({ status: { $in: ['Under Review', 'Pending Review', 'Recommended'] } });
-  const approvedLoans = await LoanApplication.countDocuments({ status: 'Approved' });
+  const approvedLoans = await LoanApplication.countDocuments({ status: { $in: ['Approved', 'APPROVED', 'ACTIVE', 'READY_FOR_DISBURSEMENT', 'Ready for Disbursement'] } });
   const activeLoans = await ActiveLoan.countDocuments({ loanStatus: 'Active', isDeleted: false });
 
   sendSuccess(res, 'Operational counts loaded', {

@@ -87,6 +87,38 @@ exports.getMyLoans = asyncHandler(async (req, res) => {
       ? Math.round((totalPaid / loan.approvedAmount) * 100) 
       : 0;
 
+    // Fetch associated LoanApplication if metadata is missing
+    let fullName = loan.fullName;
+    let emailAddress = loan.emailAddress;
+    let phoneNumber = loan.phoneNumber;
+    let idNumber = loan.idNumber;
+    let applicationId = loan.applicationId;
+    let agreementSignedAt = loan.agreementSignedAt;
+    let agreementStatus = loan.agreementStatus;
+    let agreementGeneratedAt = loan.agreementGeneratedAt;
+    let verificationIp = loan.verificationIp;
+    let verificationUserAgent = loan.verificationUserAgent;
+    let processingFee = loan.processingFee;
+    let agreementDocumentUrl = loan.agreementDocumentUrl;
+
+    if (!fullName || !applicationId) {
+      const appRecord = await LoanApplication.findById(loan.loanApplicationId);
+      if (appRecord) {
+        fullName = fullName || appRecord.fullName;
+        emailAddress = emailAddress || appRecord.emailAddress;
+        phoneNumber = phoneNumber || appRecord.phoneNumber;
+        idNumber = idNumber || appRecord.idNumber;
+        applicationId = applicationId || appRecord.applicationId;
+        agreementSignedAt = agreementSignedAt || appRecord.agreementSignedAt;
+        agreementStatus = agreementStatus || appRecord.agreementStatus;
+        agreementGeneratedAt = agreementGeneratedAt || appRecord.agreementGeneratedAt;
+        verificationIp = verificationIp || appRecord.verificationIp;
+        verificationUserAgent = verificationUserAgent || appRecord.verificationUserAgent;
+        processingFee = processingFee || appRecord.processingFee;
+        agreementDocumentUrl = agreementDocumentUrl || appRecord.agreementDocumentUrl;
+      }
+    }
+
     return {
       _id: loan._id,
       loanCode: loan.loanCode,
@@ -97,7 +129,21 @@ exports.getMyLoans = asyncHandler(async (req, res) => {
       loanDurationMonths: loan.loanDurationMonths,
       nextDueDate: loan.nextDueDate,
       loanStatus: loan.loanStatus,
-      progress
+      progress,
+      
+      // Borrower Details & Agreement Metadata
+      fullName,
+      emailAddress,
+      phoneNumber,
+      idNumber,
+      applicationId,
+      agreementSignedAt,
+      agreementStatus,
+      agreementGeneratedAt,
+      verificationIp,
+      verificationUserAgent,
+      processingFee,
+      agreementDocumentUrl
     };
   }));
 
@@ -153,7 +199,7 @@ exports.getMyLoans = asyncHandler(async (req, res) => {
     borrowerId: userId,
     status: { $nin: ['Draft'] }
   })
-    .select('applicationId requestedAmount requestedDuration status reviewStatus rejectionReason submittedAt loanType estimatedMonthlyEMI staffReview')
+    .select('applicationId requestedAmount requestedDuration status reviewStatus rejectionReason submittedAt loanType estimatedMonthlyEMI staffReview fullName phoneNumber emailAddress idNumber interestRate approvedAmount processingFee totalRepayment agreementGeneratedAt agreementSignedAt agreementStatus borrowerConsentVerified verificationIp verificationUserAgent')
     .sort({ createdAt: -1 });
 
   // 5. Fetch recent activities
@@ -176,6 +222,20 @@ exports.getMyLoans = asyncHandler(async (req, res) => {
     loanType: app.loanType,
     estimatedMonthlyEMI: app.estimatedMonthlyEMI,
     reviewInfo: buildReviewInfo(app),
+    fullName: app.fullName,
+    phoneNumber: app.phoneNumber,
+    emailAddress: app.emailAddress,
+    idNumber: app.idNumber,
+    interestRate: app.interestRate,
+    approvedAmount: app.approvedAmount,
+    processingFee: app.processingFee,
+    totalRepayment: app.totalRepayment,
+    agreementGeneratedAt: app.agreementGeneratedAt,
+    agreementSignedAt: app.agreementSignedAt,
+    agreementStatus: app.agreementStatus,
+    borrowerConsentVerified: app.borrowerConsentVerified,
+    verificationIp: app.verificationIp,
+    verificationUserAgent: app.verificationUserAgent,
   }));
 
   sendSuccess(res, 'My loans retrieved successfully', {

@@ -43,13 +43,17 @@ const agentProfileRoutes = require('./routes/agent/profileRoutes');
 const agentDashboardRoutes = require('./routes/agent/dashboardRoutes');
 const agentFollowUpRoutes = require('./routes/agent/followUpRoutes');
 const borrowerApplyLoanRoutes = require('./routes/borrowerLoanRoutes');
+const verificationRoutes = require('./routes/verification.routes');
+const agreementRoutes = require('./modules/agreementSigning/routes/agreementSigning.routes');
+const validationRoutes = require('./routes/validationRoutes');
 
 
 
 const app = express();
 
-// Body parser
-app.use(express.json());
+// Body parser — 10 MB limit supports base64 image payloads from KYC flows
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Cookie parser
 app.use(cookieParser());
@@ -114,7 +118,10 @@ app.use('/api/agent', agentRoutes);
 app.use('/api/repayments', repaymentRoutes);
 
 
+app.use('/api/verification', verificationRoutes);
+app.use('/api/agreement', agreementRoutes);
 app.use('/api/upload', uploadRoutes);
+app.use('/api/validation-rules', validationRoutes);
 
 // Base route
 app.get('/', (req, res) => {

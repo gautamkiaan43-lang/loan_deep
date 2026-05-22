@@ -103,7 +103,11 @@ const getLoanRequests = asyncHandler(async (req, res) => {
       verificationNotes: app.staffReview.verificationNotes,
       submittedAt: app.staffReview.verificationDate,
     } : null,
-    submittedDate: app.createdAt
+    submittedDate: app.createdAt,
+    staffReviewLocked: app.staffReviewLocked || false,
+    staffReviewCompleted: app.staffReviewCompleted || false,
+    reviewSubmittedAt: app.reviewSubmittedAt || null,
+    reviewStage: app.reviewStage || 'PENDING'
   }));
 
   sendSuccess(res, 'Queue fetched successfully', {
@@ -143,6 +147,18 @@ const getLoanRequestById = asyncHandler(async (req, res) => {
     uploadedDocsStatus: app.uploadedDocsStatus,
     documentVerification: app.documentVerification || {},
     
+    staffReviewLocked: app.staffReviewLocked || false,
+    staffReviewCompleted: app.staffReviewCompleted || false,
+    reviewSubmittedAt: app.reviewSubmittedAt || null,
+    reviewStage: app.reviewStage || 'PENDING',
+    staffReview: app.staffReview?.verificationDate ? {
+      recommendation: app.staffReview.recommendation,
+      riskLevel: app.staffReview.riskLevel || 'N/A',
+      verificationNotes: app.staffReview.verificationNotes,
+      staffName: app.staffReview.staffName,
+      submittedAt: app.staffReview.verificationDate
+    } : null,
+
     borrower: {
       fullName: app.fullName || app.borrowerId?.fullName || 'N/A',
       email: app.emailAddress || app.borrowerId?.email || 'N/A',
@@ -203,6 +219,13 @@ const verifyDocuments = asyncHandler(async (req, res) => {
   const app = await LoanApplication.findById(req.params.id);
   if (!app) {
     return sendError(res, 'Application not found', 404);
+  }
+
+  // Prevent changing document verification on locked reviews
+  const isLocked = app.staffReviewLocked || 
+    ['Approved', 'APPROVED', 'Active', 'ACTIVE', 'Ready for Disbursement', 'READY_FOR_DISBURSEMENT', 'Agreement Signed', 'AGREEMENT_SIGNED', 'OTP_VERIFIED', 'OTP Verified', 'Reviewed', 'AGREEMENT_PENDING_VERIFICATION'].includes(app.status);
+  if (isLocked) {
+    return sendError(res, 'This review has already been finalized and locked', 400);
   }
 
   // Initialize document container if missing
@@ -282,6 +305,25 @@ const submitReview = asyncHandler(async (req, res) => {
     return sendError(res, 'Application not found', 404);
   }
 
+  // Prevent duplicate submissions on locked reviews
+  const isLocked = app.staffReviewLocked || 
+    ['Approved', 'APPROVED', 'Active', 'ACTIVE', 'Ready for Disbursement', 'READY_FOR_DISBURSEMENT', 'Agreement Signed', 'AGREEMENT_SIGNED', 'OTP_VERIFIED', 'OTP Verified', 'Reviewed', 'AGREEMENT_PENDING_VERIFICATION'].includes(app.status);
+  if (isLocked) {
+    return sendError(res, 'This review has already been finalized and locked', 400);
+  }
+
+  // --- Dynamic Centralized Rules Validation on Approval Recommendation ---
+  if (recommendation === 'Recommend Approval' || recommendation === 'Approved') {
+    const { validateDBApplication } = require('../../utils/loanValidationEngine');
+    const validationResult = await validateDBApplication(app._id);
+    if (!validationResult.isValid) {
+      return res.status(400).json({
+        success: false,
+        validationErrors: validationResult.errors
+      });
+    }
+  }
+
   // Apply Staff review payloads
   app.staffReview = {
     reviewedBy: req.user._id,
@@ -302,6 +344,12 @@ const submitReview = asyncHandler(async (req, res) => {
   } else {
     app.reviewStatus = 'Reviewed';
   }
+
+  // Lock review permanently
+  app.staffReviewLocked = true;
+  app.staffReviewCompleted = true;
+  app.reviewSubmittedAt = new Date();
+  app.reviewStage = 'FINALIZED';
   
   await app.save();
 

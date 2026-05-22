@@ -6,6 +6,7 @@ dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const connectDB = require('./config/db');
 const app = require('./app');
+const { initializeDatanamixAuth } = require('./services/datanamix/datanamixAuth.service');
 
 // Connect to database
 connectDB();
@@ -18,6 +19,11 @@ const { initCronJobs } = require('./services/cronService');
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
   console.log(`✅ ImageKit initialized`);
+});
+
+// Initialize Datanamix authentication asynchronously — non-blocking startup
+initializeDatanamixAuth().catch((err) => {
+  console.error('[Datanamix] Fatal auth bootstrap error:', err.message);
 });
 
 // Initialize Socket.IO

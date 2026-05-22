@@ -10,7 +10,8 @@ const {
   getLoanDetails,
   updateLoanStatus,
   addAdminNotes,
-  softDeleteLoan,
+  closeLoan,
+  deleteLoan,
   assignAgent
 } = require('../../controllers/admin/activeLoanController');
 const { protect } = require('../../middlewares/authMiddleware');
@@ -30,13 +31,15 @@ router.get('/due-payments', getDuePayments);
 // Core CRUD
 router.get('/', getAllActiveLoans);
 router.get('/:id', getLoanDetails);
-router.delete('/:id', softDeleteLoan);
+router.delete('/:id', deleteLoan);
 
-// Status and Notes
+// Status, Notes, and Closure
 router.put('/:id/status', updateLoanStatus);
 router.put('/:id/notes', addAdminNotes);
+router.put('/:id/close', closeLoan);
 
 // Agent Assignment
 router.post('/assign-agent', assignAgent);
 
 module.exports = router;
+

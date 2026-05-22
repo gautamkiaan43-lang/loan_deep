@@ -1,5 +1,6 @@
 const asyncHandler = require('express-async-handler');
 const ActiveLoan = require('../../models/ActiveLoan');
+const LoanApplication = require('../../models/LoanApplication');
 const Agent = require('../../models/Agent');
 const AgentAssignment = require('../../models/AgentAssignment');
 const Notification = require('../../models/Notification');
@@ -46,10 +47,32 @@ const getAllActiveLoans = asyncHandler(async (req, res) => {
     .skip(skip)
     .limit(Number(limit));
 
+  const populatedLoans = await Promise.all(activeLoans.map(async (loan) => {
+    const loanObj = loan.toObject();
+    if (!loanObj.fullName || !loanObj.applicationId) {
+      const appRecord = await LoanApplication.findById(loanObj.loanApplicationId);
+      if (appRecord) {
+        loanObj.fullName = loanObj.fullName || appRecord.fullName;
+        loanObj.emailAddress = loanObj.emailAddress || appRecord.emailAddress;
+        loanObj.phoneNumber = loanObj.phoneNumber || appRecord.phoneNumber;
+        loanObj.idNumber = loanObj.idNumber || appRecord.idNumber;
+        loanObj.applicationId = loanObj.applicationId || appRecord.applicationId;
+        loanObj.agreementSignedAt = loanObj.agreementSignedAt || appRecord.agreementSignedAt;
+        loanObj.agreementStatus = loanObj.agreementStatus || appRecord.agreementStatus;
+        loanObj.agreementGeneratedAt = loanObj.agreementGeneratedAt || appRecord.agreementGeneratedAt;
+        loanObj.verificationIp = loanObj.verificationIp || appRecord.verificationIp;
+        loanObj.verificationUserAgent = loanObj.verificationUserAgent || appRecord.verificationUserAgent;
+        loanObj.processingFee = loanObj.processingFee || appRecord.processingFee;
+        loanObj.agreementDocumentUrl = loanObj.agreementDocumentUrl || appRecord.agreementDocumentUrl;
+      }
+    }
+    return loanObj;
+  }));
+
   const total = await ActiveLoan.countDocuments(query);
 
   sendSuccess(res, 'Active loans fetched successfully', {
-    activeLoans,
+    activeLoans: populatedLoans,
     pagination: {
       total,
       page: Number(page),
@@ -168,7 +191,26 @@ const getLoanDetails = asyncHandler(async (req, res) => {
     return sendError(res, 'Loan not found', 404);
   }
 
-  sendSuccess(res, 'Loan details fetched successfully', { activeLoan });
+  const loanObj = activeLoan.toObject();
+  if (!loanObj.fullName || !loanObj.applicationId) {
+    const appRecord = await LoanApplication.findById(loanObj.loanApplicationId);
+    if (appRecord) {
+      loanObj.fullName = loanObj.fullName || appRecord.fullName;
+      loanObj.emailAddress = loanObj.emailAddress || appRecord.emailAddress;
+      loanObj.phoneNumber = loanObj.phoneNumber || appRecord.phoneNumber;
+      loanObj.idNumber = loanObj.idNumber || appRecord.idNumber;
+      loanObj.applicationId = loanObj.applicationId || appRecord.applicationId;
+      loanObj.agreementSignedAt = loanObj.agreementSignedAt || appRecord.agreementSignedAt;
+      loanObj.agreementStatus = loanObj.agreementStatus || appRecord.agreementStatus;
+      loanObj.agreementGeneratedAt = loanObj.agreementGeneratedAt || appRecord.agreementGeneratedAt;
+      loanObj.verificationIp = loanObj.verificationIp || appRecord.verificationIp;
+      loanObj.verificationUserAgent = loanObj.verificationUserAgent || appRecord.verificationUserAgent;
+      loanObj.processingFee = loanObj.processingFee || appRecord.processingFee;
+      loanObj.agreementDocumentUrl = loanObj.agreementDocumentUrl || appRecord.agreementDocumentUrl;
+    }
+  }
+
+  sendSuccess(res, 'Loan details fetched successfully', { activeLoan: loanObj });
 });
 
 /**
@@ -217,21 +259,151 @@ const addAdminNotes = asyncHandler(async (req, res) => {
 });
 
 /**
- * @desc    Soft delete loan
- * @route   DELETE /api/admin/active-loans/:id
+ * @desc    Close an active loan (admin-only — required before deletion)
+ * @route   PUT /api/admin/active-loans/:id/close
  * @access  Private/Admin
  */
-const softDeleteLoan = asyncHandler(async (req, res) => {
+const closeLoan = asyncHandler(async (req, res) => {
+  const { closureReason, closureNotes } = req.body;
+
+  if (!closureReason) {
+    return sendError(res, 'Closure reason is required', 400);
+  }
+
   const activeLoan = await ActiveLoan.findOne({ _id: req.params.id, isDeleted: false });
 
   if (!activeLoan) {
     return sendError(res, 'Loan not found', 404);
   }
 
-  activeLoan.isDeleted = true;
+  if (activeLoan.loanStatus === 'Closed') {
+    return sendError(res, 'Loan is already closed', 400);
+  }
+
+  // Apply closure
+  activeLoan.loanStatus = 'Closed';
+  activeLoan.closedAt = new Date();
+  activeLoan.closedBy = req.user._id;
+  activeLoan.closureReason = closureReason;
+  activeLoan.closureNotes = closureNotes || '';
+
   await activeLoan.save();
 
-  sendSuccess(res, 'Loan soft deleted successfully');
+  // Emit real-time update
+  try {
+    const io = getIO();
+    if (io) {
+      io.emit('loan:closed', {
+        loanId: activeLoan._id,
+        loanCode: activeLoan.loanCode,
+        closureReason
+      });
+      io.emit('dashboard:updated', { trigger: 'loan_closure' });
+    }
+  } catch (ioErr) {}
+
+  sendSuccess(res, 'Loan closed successfully', { activeLoan });
+});
+
+/**
+ * @desc    Permanently delete a CLOSED loan with full cascade removal
+ * @route   DELETE /api/admin/active-loans/:id
+ * @access  Private/Admin
+ *
+ * SECURITY RULE: Only loans with loanStatus === 'Closed' can be deleted.
+ * Deletion cascades to RepaymentSchedule and Payment records.
+ */
+const deleteLoan = asyncHandler(async (req, res) => {
+  const activeLoan = await ActiveLoan.findOne({ _id: req.params.id, isDeleted: false });
+
+  if (!activeLoan) {
+    return sendError(res, 'Loan not found', 404);
+  }
+
+  // Hard security gate — enforce close-before-delete
+  if (activeLoan.loanStatus !== 'Closed') {
+    return sendError(
+      res,
+      'Only closed loans can be deleted. Please close the loan first before attempting deletion.',
+      400
+    );
+  }
+
+  const mongoose = require('mongoose');
+  const RepaymentSchedule = require('../../models/RepaymentSchedule');
+  const Payment = require('../../models/Payment');
+  const DuePayment = require('../../models/DuePayment');
+  const AgentAssignment = require('../../models/AgentAssignment');
+  const Commission = require('../../models/Commission');
+  const LoanActivity = require('../../models/LoanActivity');
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Cascade delete: remove all linked repayment schedules
+    await RepaymentSchedule.deleteMany(
+      { activeLoanId: activeLoan._id },
+      { session }
+    );
+
+    // Cascade delete: remove all linked payment records
+    await Payment.deleteMany(
+      { activeLoanId: activeLoan._id },
+      { session }
+    );
+
+    // Cascade delete: remove all linked due payment records
+    await DuePayment.deleteMany(
+      { loanId: activeLoan._id },
+      { session }
+    );
+
+    // Cascade delete: remove all linked agent assignments
+    await AgentAssignment.deleteMany(
+      { loanId: activeLoan._id },
+      { session }
+    );
+
+    // Cascade delete: remove all linked commissions
+    await Commission.deleteMany(
+      { loanId: activeLoan._id },
+      { session }
+    );
+
+    // Cascade delete: remove all linked loan activities
+    await LoanActivity.deleteMany(
+      { loanId: activeLoan._id },
+      { session }
+    );
+
+    // Hard delete the active loan itself
+    await ActiveLoan.deleteOne({ _id: activeLoan._id }, { session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    // Emit real-time update to refresh all dashboards
+    try {
+      const io = getIO();
+      if (io) {
+        io.emit('loan:deleted', {
+          loanId: activeLoan._id,
+          loanCode: activeLoan.loanCode
+        });
+        io.emit('dashboard:updated', { trigger: 'loan_deletion' });
+      }
+    } catch (ioErr) {}
+
+    sendSuccess(res, 'Loan and all linked records permanently deleted');
+  } catch (err) {
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
+    session.endSession();
+    console.error('Loan deletion cascade error:', err);
+    return sendError(res, 'Deletion failed: ' + err.message, 500);
+  }
 });
 
 /**
@@ -377,6 +549,7 @@ module.exports = {
   getLoanDetails,
   updateLoanStatus,
   addAdminNotes,
-  softDeleteLoan,
+  closeLoan,
+  deleteLoan,
   assignAgent
 };

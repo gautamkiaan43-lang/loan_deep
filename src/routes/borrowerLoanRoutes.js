@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { 
-  getLoanEstimate, 
+const {
+  getLoanEstimate,
+  createDraftApplication,
   uploadOnly,
   submitFullApplication,
   getApplicationStatus
@@ -12,6 +13,7 @@ const upload = require('../middlewares/uploadMiddleware');
 router.use(protect);
 
 router.get('/estimate', getLoanEstimate);
+router.post('/create-draft', createDraftApplication);
 router.post('/upload', upload.single('file'), uploadOnly);
 router.post('/submit-full', submitFullApplication);
 router.get('/status/:applicationId', getApplicationStatus);

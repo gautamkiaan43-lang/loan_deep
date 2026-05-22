@@ -54,6 +54,29 @@ const activeLoanSchema = new mongoose.Schema({
   
   approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   approvedDate: { type: Date, default: Date.now },
+
+  // Disbursement & Agreement Metadata
+  disbursementReady: { type: Boolean, default: true },
+  disbursementStatus: { type: String, default: 'Ready for Disbursement' },
+  agreementStatus: { type: String, default: 'SIGNED' },
+  agreementSignedAt: { type: Date },
+  agreementDocumentUrl: { type: String },
+  applicationId: { type: String },
+  fullName: { type: String },
+  emailAddress: { type: String },
+  phoneNumber: { type: String },
+  idNumber: { type: String },
+  requestedAmount: { type: Number },
+  requestedDuration: { type: Number },
+  estimatedMonthlyEMI: { type: Number },
+  agreementGeneratedAt: { type: Date },
+  verificationIp: { type: String },
+  verificationUserAgent: { type: String },
+  agreementHtml: { type: String, default: '' },
+  agreementPdfUrl: { type: String, default: '' },
+  signedAgreement: { type: String, default: '' },
+  otpVerificationStatus: { type: String, default: '' },
+  processingFee: { type: Number },
   
   // Agent Assignment & Recovery Operations
   assignedAgent: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -74,6 +97,12 @@ const activeLoanSchema = new mongoose.Schema({
   
   lastPaymentDate: { type: Date },
   
+  // Loan Closure Metadata (admin close-before-delete lifecycle)
+  closedAt: { type: Date },
+  closedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  closureReason: { type: String },
+  closureNotes: { type: String },
+
   notes: { type: String },
   isDeleted: { type: Boolean, default: false }
 }, {
