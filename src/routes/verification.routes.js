@@ -17,9 +17,12 @@ const {
   overrideKYCController,
   verifyAddressProfileController,
   overrideBureauController,
+  verifyPhoneByApplicationController,
+  verifyBankVerificationController,
   runCreditAssessmentController,
   overrideCreditAssessmentController,
   fetchConsumerCreditReportController,
+  verifyAMLScreeningController,
 } = require('../controllers/verification.controller');
 
 const { protectVerification } = require('../middleware/auth.middleware');
@@ -31,7 +34,7 @@ const kycUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf'];
+    const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'application/pdf'];
     cb(null, allowed.includes(file.mimetype));
   },
 });
@@ -127,6 +130,7 @@ router.post(
  * @access  Private (admin only enforced at controller level via req.user)
  */
 router.put('/kyc-override/:applicationId', overrideKYCController);
+router.post('/kyc-override/:applicationId', overrideKYCController);
 
 /**
  * @route   POST /api/verification/address-plus-profile-idv
@@ -143,9 +147,23 @@ router.post('/address-plus-profile-idv', verifyAddressProfileController);
 router.put('/bureau-override/:applicationId', overrideBureauController);
 
 /**
+ * @route   POST /api/verification/phone-verification/:applicationId
+ * @desc    Step 1.75: Datanamix Contact To ID — verifies phone number ownership against SA ID
+ * @access  Private — requires KYC passed + bureau not rejected
+ */
+router.post('/phone-verification/:applicationId', verifyPhoneByApplicationController);
+
+/**
+ * @route   POST /api/verification/bank-verification/:applicationId
+ * @desc    Step 3: Datanamix AVS Advanced — verifies bank account ownership against SA ID
+ * @access  Private — requires KYC passed + bureau not rejected
+ */
+router.post('/bank-verification/:applicationId', verifyBankVerificationController);
+
+/**
  * @route   POST /api/verification/consumer-credit-search
  * @desc    Step 2: Datanamix Consumer Credit Search — generates EnquiryID + EnquiryResultID
- * @access  Private — requires KYC passed + bureau not rejected
+ * @access  Private — requires KYC passed + bureau not rejected + phone verified
  */
 router.post('/consumer-credit-search', runCreditAssessmentController);
 
@@ -162,5 +180,12 @@ router.put('/credit-search-override/:applicationId', overrideCreditAssessmentCon
  * @access  Private — requires credit search (step 3) with valid enquiry IDs
  */
 router.post('/consumer-credit-report/:applicationId', fetchConsumerCreditReportController);
+
+/**
+ * @route   POST /api/verification/aml-screening/:applicationId
+ * @desc    Step 5: Perform AML, watchlists, PEP, and sanctions screening
+ * @access  Private
+ */
+router.post('/aml-screening/:applicationId', verifyAMLScreeningController);
 
 module.exports = router;

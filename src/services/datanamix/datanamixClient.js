@@ -1,7 +1,7 @@
 const axios = require('axios');
 const { getAccessToken, refreshToken } = require('./datanamixAuth.service');
 
-const BASE_URL = process.env.DATANAMIX_BASE_URL || 'https://veriid.com/API_Manager/';
+const BASE_URL = (process.env.DATANAMIX_BASE_URL || 'https://api.datanamix.com').replace(/\/$/, '');
 
 // ─── Axios instance ───────────────────────────────────────────────────────────
 const datanamixAxiosClient = axios.create({

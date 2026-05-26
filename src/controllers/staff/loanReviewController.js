@@ -180,7 +180,7 @@ const getLoanReviewById = asyncHandler(async (req, res) => {
     },
 
     documents: {
-      idDocument: docs.find(d => d.documentType === 'ID Document')?.fileUrl || null,
+      idDocument: docs.find(d => ['ID Document', 'ID Front'].includes(d.documentType))?.fileUrl || null,
       payslip: docs.find(d => d.documentType === 'Payslip')?.fileUrl || null,
       bankStatement: docs.find(d => d.documentType === 'Bank Statement')?.fileUrl || null,
       proofOfAddress: docs.find(d => d.documentType === 'Proof Of Address')?.fileUrl || null

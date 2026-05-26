@@ -228,6 +228,52 @@ const loanApplicationSchema = new mongoose.Schema(
       verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
     },
 
+    // ── Phone Verification (Datanamix Contact To ID — Step 1.75) ────────────
+    phoneVerification: {
+      verificationStatus: {
+        type: String,
+        enum: ['Pending', 'Verified', 'Rejected', 'Failed'],
+        default: 'Pending',
+      },
+      verifiedPhoneNumber: { type: String },
+      reportReference:     { type: String },
+      ownershipMatched:    { type: Boolean, default: false },
+      mismatchDetected:    { type: Boolean, default: false },
+      mismatchReason:      { type: String },
+      matchedConsumers:    [{ type: mongoose.Schema.Types.Mixed }],
+      verifiedAt:          { type: Date },
+      rawResponse:         { type: mongoose.Schema.Types.Mixed, default: {} },
+    },
+
+    // ── Bank Account Verification (Datanamix AVS Advanced — Step 3) ─────────
+    bankVerification: {
+      verificationStatus: {
+        type: String,
+        enum: ['Pending', 'Verified', 'VerifiedWithWarnings', 'Rejected', 'Failed'],
+        default: 'Pending',
+      },
+      statusMessage:        { type: String },
+      accountFound:         { type: String },
+      accountOpen:          { type: String },
+      acceptsCredits:       { type: String },
+      identityMatch:        { type: String },
+      accountTypeMatch:     { type: String },
+      initialsMatch:        { type: String },
+      nameMatch:            { type: String },
+      emailMatch:           { type: String },
+      phoneMatch:           { type: String },
+      bankReference:        { type: String },
+      bankStatusCode:       { type: String },
+      bankStatusMessage:    { type: String },
+      reportReference:      { type: String },
+      verifiedAt:           { type: Date },
+      verifiedBankAccount:  { type: String },
+      verifiedBranchCode:   { type: String },
+      verifiedAccountType:  { type: String },
+      pdfReport:            { type: String },
+      rawResponse:          { type: mongoose.Schema.Types.Mixed, default: {} },
+    },
+
     // ── Consumer Credit Report Search (Datanamix — Step 2) ──────────────────
     creditAssessment: {
       verificationStatus: {
@@ -329,6 +375,45 @@ const loanApplicationSchema = new mongoose.Schema(
 
       pdfReport:   { type: String },
       rawResponse: { type: mongoose.Schema.Types.Mixed, default: {} }
+    },
+
+    // ── AML & Sanctions Screening ────────────────────────────────────────────
+    amlVerification: {
+      verificationStatus: {
+        type: String,
+        enum: [
+          "NOT_STARTED",
+          "VERIFYING",
+          "CLEARED",
+          "MANUAL_REVIEW",
+          "AUTO_REJECT",
+          "HIGH_RISK",
+          "FAILED"
+        ],
+        default: "NOT_STARTED"
+      },
+      amlScore: Number,
+      found: Boolean,
+      pepMatch: Boolean,
+      sanctionsMatch: Boolean,
+      terrorMatch: Boolean,
+      fraudMatch: Boolean,
+      adverseMediaMatch: Boolean,
+      ofacMatch: Boolean,
+      fatfMatch: Boolean,
+      riskLevel: String,
+      riskReason: String,
+      reportReference: String,
+      clientReference: String,
+      matchCount: Number,
+      matchedEntities: [],
+      screeningDate: Date,
+      rawResponse: {},
+      pdfReport: String,
+      sanctionsStatus: String,
+      complianceDecision: String,
+      isBlocked: { type: Boolean, default: false },
+      screeningTimestamp: Date
     },
 
     // Digital Agreement Signature Fields

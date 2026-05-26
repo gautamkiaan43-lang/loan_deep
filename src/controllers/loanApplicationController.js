@@ -22,6 +22,7 @@ const getAllApplications = asyncHandler(async (req, res) => {
     search = '', 
     status, 
     staffReviewer, 
+    amlStatus,
     minAmount, 
     maxAmount,
     startDate,
@@ -56,6 +57,23 @@ const getAllApplications = asyncHandler(async (req, res) => {
   // Filter by staff reviewer
   if (staffReviewer) {
     query['staffReview.staffName'] = { $regex: staffReviewer, $options: 'i' };
+  }
+
+  if (amlStatus === 'AML_CLEARED') {
+    query['amlVerification.verificationStatus'] = 'CLEARED';
+  } else if (amlStatus === 'MANUAL_REVIEW') {
+    query['amlVerification.verificationStatus'] = 'MANUAL_REVIEW';
+  } else if (amlStatus === 'BLOCKED') {
+    query.$and = [
+      ...(query.$and || []),
+      {
+        $or: [
+          { 'amlVerification.verificationStatus': { $in: ['AUTO_REJECT', 'HIGH_RISK'] } },
+          { 'amlVerification.complianceDecision': 'AUTO_REJECT' },
+          { 'amlVerification.isBlocked': true }
+        ]
+      }
+    ];
   }
 
   // Filter by requested amount range
@@ -122,6 +140,7 @@ const getAllApplications = asyncHandler(async (req, res) => {
         : (app.staffReview?.staffName ? { fullName: app.staffReview.staffName } : null),
       assignedAt: app.assignedAt || null,
       status: app.status,
+      amlVerification: app.amlVerification,
       hasActiveLoan: activeLoanIds.has(app._id.toString()),
       reviewStatus: app.reviewStatus === 'Pending' && app.staffReview?.recommendation && app.staffReview.recommendation !== 'Pending'
         ? (app.staffReview.recommendation.includes('Reject') ? 'Rejected Recommendation' : 'Recommendation Submitted')
@@ -165,6 +184,17 @@ const getApplicationStats = asyncHandler(async (req, res) => {
   ]);
 
   const total = await LoanApplication.countDocuments();
+  const [amlCleared, amlManualReview, amlBlocked] = await Promise.all([
+    LoanApplication.countDocuments({ 'amlVerification.verificationStatus': 'CLEARED' }),
+    LoanApplication.countDocuments({ 'amlVerification.verificationStatus': 'MANUAL_REVIEW' }),
+    LoanApplication.countDocuments({
+      $or: [
+        { 'amlVerification.verificationStatus': { $in: ['AUTO_REJECT', 'HIGH_RISK'] } },
+        { 'amlVerification.complianceDecision': 'AUTO_REJECT' },
+        { 'amlVerification.isBlocked': true }
+      ]
+    })
+  ]);
 
   const formattedStats = {
     All: total,
@@ -173,7 +203,10 @@ const getApplicationStats = asyncHandler(async (req, res) => {
     Recommended: 0,
     Hold: 0,
     Approved: 0,
-    Rejected: 0
+    Rejected: 0,
+    amlCleared,
+    amlManualReview,
+    amlBlocked
   };
 
   stats.forEach(stat => {
@@ -971,10 +1004,25 @@ const createApplicationOnBehalf = asyncHandler(async (req, res) => {
 
   const documentVerificationStatus = allDocsPresent ? 'Complete' : submittedDocTypes.length > 0 ? 'Incomplete' : 'Pending';
   const creditRiskReady = allDocsPresent && !!creditConsentAccepted;
+
+  // Retrieve existing draft for compliance check & preservation
+  const draft = await LoanApplication.findOne({ borrowerId: borrowerId, idNumber: personal.idNumber, status: 'Draft' });
+  const aml = draft?.amlVerification || {};
+  const amlStatus = aml.verificationStatus || 'NOT_STARTED';
+
+  // Calculate final application audit status (Fix 3)
   let applicationAuditStatus = 'Incomplete';
-  if (creditRiskReady) applicationAuditStatus = 'Ready For Review';
-  else if (!allDocsPresent) applicationAuditStatus = 'Missing Documents';
-  else if (!creditConsentAccepted) applicationAuditStatus = 'Credit Consent Missing';
+  if (amlStatus === 'AUTO_REJECT' || amlStatus === 'HIGH_RISK' || aml.complianceDecision === 'AUTO_REJECT') {
+    applicationAuditStatus = 'APPLICATION BLOCKED';
+  } else if (amlStatus === 'MANUAL_REVIEW') {
+    applicationAuditStatus = 'MANUAL COMPLIANCE REVIEW REQUIRED';
+  } else if (amlStatus === 'CLEARED') {
+    applicationAuditStatus = 'READY FOR REVIEW STAGE';
+  } else {
+    if (creditRiskReady) applicationAuditStatus = 'Ready For Review';
+    else if (!allDocsPresent) applicationAuditStatus = 'Missing Documents';
+    else if (!creditConsentAccepted) applicationAuditStatus = 'Credit Consent Missing';
+  }
 
   // --- START TRANSACTION ---
   const mongoose = require('mongoose');
@@ -982,8 +1030,7 @@ const createApplicationOnBehalf = asyncHandler(async (req, res) => {
   session.startTransaction();
 
   try {
-    // 1. Create Loan Application Record
-    const [application] = await LoanApplication.create([{
+    const appData = {
       borrowerId: borrowerId,
       fullName: personal.fullName,
       phoneNumber: personal.phoneNumber,
@@ -1005,7 +1052,18 @@ const createApplicationOnBehalf = asyncHandler(async (req, res) => {
       documentVerificationStatus,
       creditRiskReady,
       applicationAuditStatus,
-    }], { session });
+    };
+
+    let application;
+    if (draft) {
+      // Preserve existing draft so we don't lose the KYC, bureau, phone, bank and AML results!
+      Object.assign(draft, appData);
+      application = await draft.save({ session });
+    } else {
+      // Fallback: create fresh application
+      const [newApp] = await LoanApplication.create([appData], { session });
+      application = newApp;
+    }
 
     // 2. Create Related Records
     await LoanEmployment.create([{

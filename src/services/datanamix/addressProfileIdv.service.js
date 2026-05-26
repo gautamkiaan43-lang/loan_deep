@@ -236,13 +236,16 @@ const callAddressPlusProfileIdv = async ({
     PassportNumber:        passportNumber,
     ClientReference:       reference,
     OutputFormat:          'JSON_AND_PDF',
-    PDFEncryptionPassword: '',
+    PDFEncryptionPassword: '0123456789',
     EnvironmentType:       'SANDBOX',
   };
 
-  console.log(`[BUREAU] Calling Datanamix Address Plus Profile IDV — Ref: ${reference}`);
+  console.log("ADDRESS PLUS OUTGOING PAYLOAD", payload);
 
   const response = await datanamixAxiosClient.post(ENDPOINT, payload);
+
+  console.log("RAW ADDRESS PLUS RESPONSE", response.data);
+
   const normalized = normalizeResponse(response.data);
   const { mismatchFlags, comparedFields } = detectMismatches(borrowerData, normalized);
 

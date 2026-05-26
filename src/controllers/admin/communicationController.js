@@ -2,6 +2,7 @@ const asyncHandler = require('express-async-handler');
 const Conversation = require('../../models/Conversation');
 const Message = require('../../models/Message');
 const User = require('../../models/User');
+const Borrower = require('../../models/Borrower');
 const { getIO } = require('../../socket/socketServer');
 const { sendSuccess, sendError } = require('../../utils/responseHandler');
 const { createNotification } = require('../../utils/notificationHelper');
@@ -13,6 +14,10 @@ const { createNotification } = require('../../utils/notificationHelper');
  */
 const getAllConversations = asyncHandler(async (req, res) => {
   const { filter } = req.query; // e.g., 'borrower', 'agent', 'staff'
+  const shouldIncludeBorrowers = !filter || filter === 'all' || filter === 'borrower';
+  const activeBorrowerUserIds = shouldIncludeBorrowers
+    ? new Set((await Borrower.find({ userId: { $ne: null } }).select('userId').lean()).map(b => b.userId.toString()))
+    : new Set();
 
   let conversations = await Conversation.find({
     participants: req.user._id,
@@ -21,14 +26,28 @@ const getAllConversations = asyncHandler(async (req, res) => {
     .populate('participants', 'fullName email role profilePhoto accountStatus status')
     .sort({ updatedAt: -1 });
 
-  // 2. Construct Query for all active system users
-  let userQuery = {
-    role: { $in: ['borrower', 'agent', 'staff'] },
-    isDeleted: { $ne: true }
-  };
-
-  if (filter && filter !== 'all') {
-    userQuery.role = filter;
+  // 2. Construct Query for all active system users.
+  // Borrowers must also exist in Borrower profiles, matching the Admin Borrowers menu.
+  let userQuery;
+  if (filter === 'borrower') {
+    userQuery = {
+      role: 'borrower',
+      _id: { $in: [...activeBorrowerUserIds] },
+      isDeleted: { $ne: true }
+    };
+  } else if (filter && filter !== 'all') {
+    userQuery = {
+      role: filter,
+      isDeleted: { $ne: true }
+    };
+  } else {
+    userQuery = {
+      isDeleted: { $ne: true },
+      $or: [
+        { role: 'borrower', _id: { $in: [...activeBorrowerUserIds] } },
+        { role: { $in: ['agent', 'staff'] } }
+      ]
+    };
   }
 
   const systemUsers = await User.find(userQuery).select('fullName email role profilePhoto accountStatus status');
@@ -38,9 +57,10 @@ const getAllConversations = asyncHandler(async (req, res) => {
   const conversationUserMap = new Map();
 
   conversations.forEach(c => {
-    const peer = c.participants.find(p => p._id.toString() !== req.user._id.toString());
+    const peer = c.participants.find(p => p?._id?.toString() !== req.user._id.toString());
     if (peer) {
       const peerIdStr = peer._id.toString();
+      if (peer.role === 'borrower' && !activeBorrowerUserIds.has(peerIdStr)) return;
       // Only set if not already present (since conversations are sorted by updatedAt: -1, 
       // the first one we see is the most recent)
       if (!conversationUserMap.has(peerIdStr)) {
@@ -230,13 +250,21 @@ const broadcastMessage = asyncHandler(async (req, res) => {
 
   let usersToBroadcast = [];
   if (targetGroup === 'Borrower') {
-    usersToBroadcast = await User.find({ role: 'borrower' });
+    const activeBorrowerUserIds = await Borrower.find({ userId: { $ne: null } }).distinct('userId');
+    usersToBroadcast = await User.find({ role: 'borrower', _id: { $in: activeBorrowerUserIds }, isDeleted: { $ne: true } });
   } else if (targetGroup === 'Agent') {
-    usersToBroadcast = await User.find({ role: 'agent' });
+    usersToBroadcast = await User.find({ role: 'agent', isDeleted: { $ne: true } });
   } else if (targetGroup === 'Staff') {
-    usersToBroadcast = await User.find({ role: 'staff' });
+    usersToBroadcast = await User.find({ role: 'staff', isDeleted: { $ne: true } });
   } else if (targetGroup === 'All') {
-    usersToBroadcast = await User.find({ role: { $ne: 'admin' } });
+    const activeBorrowerUserIds = await Borrower.find({ userId: { $ne: null } }).distinct('userId');
+    usersToBroadcast = await User.find({
+      isDeleted: { $ne: true },
+      $or: [
+        { role: 'borrower', _id: { $in: activeBorrowerUserIds } },
+        { role: { $in: ['agent', 'staff'] } }
+      ]
+    });
   }
 
   // Create a broadcast conversation or individual messages?
@@ -337,8 +365,10 @@ const markMessagesRead = asyncHandler(async (req, res) => {
  */
 const searchConversations = asyncHandler(async (req, res) => {
   const { query } = req.query;
+  const activeBorrowerUserIds = new Set((await Borrower.find({ userId: { $ne: null } }).select('userId').lean()).map(b => b.userId.toString()));
 
   const users = await User.find({
+    isDeleted: { $ne: true },
     $or: [
       { fullName: { $regex: query, $options: 'i' } },
       { role: { $regex: query, $options: 'i' } }
@@ -352,7 +382,13 @@ const searchConversations = asyncHandler(async (req, res) => {
     participants: { $in: userIds }
   }).populate('participants', 'fullName email role profilePhoto');
 
-  sendSuccess(res, 'Search results', conversations);
+  const filteredConversations = conversations.filter(conversation =>
+    conversation.participants.every(participant =>
+      participant && (participant.role !== 'borrower' || activeBorrowerUserIds.has(participant._id.toString()))
+    )
+  );
+
+  sendSuccess(res, 'Search results', filteredConversations);
 });
 
 /**

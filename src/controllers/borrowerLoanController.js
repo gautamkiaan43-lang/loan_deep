@@ -131,13 +131,17 @@ exports.uploadOnly = asyncHandler(async (req, res, next) => {
 // @route   POST /api/borrower/apply-loan/create-draft
 // @access  Protected
 exports.createDraftApplication = asyncHandler(async (req, res, next) => {
-  const { idNumber, fullName, phoneNumber, emailAddress, dateOfBirth, residentialAddress } = req.body;
+  const { idNumber, fullName, phoneNumber, emailAddress, dateOfBirth, residentialAddress, borrowerId } = req.body;
 
   if (!idNumber) return sendError(res, 'idNumber is required', 400);
 
+  const targetBorrowerId = (req.user?.role === 'admin' || req.user?.role === 'staff') && borrowerId
+    ? borrowerId
+    : req.user._id;
+
   // Return existing draft for this borrower + idNumber without creating a duplicate
   const existing = await LoanApplication.findOne({
-    borrowerId: req.user._id,
+    borrowerId: targetBorrowerId,
     idNumber,
     status: 'Draft',
   });
@@ -160,11 +164,11 @@ exports.createDraftApplication = asyncHandler(async (req, res, next) => {
   }
 
   const draft = await LoanApplication.create({
-    borrowerId:          req.user._id,
+    borrowerId:          targetBorrowerId,
     fullName:            fullName            || 'Draft',
     idNumber,
     phoneNumber:         phoneNumber         || '0000000000',
-    emailAddress:        emailAddress        || req.user.email || 'draft@pending.com',
+    emailAddress:        emailAddress        || (targetBorrowerId === req.user?._id ? req.user?.email : undefined) || 'draft@pending.com',
     dateOfBirth:         dateOfBirth         ? new Date(dateOfBirth) : new Date('1990-01-01'),
     residentialAddress:  residentialAddress  || 'Draft Address',
     status:              'Draft',
@@ -307,18 +311,51 @@ exports.submitFullApplication = asyncHandler(async (req, res, next) => {
 
   const documentVerificationStatus = allDocsPresent ? 'Complete' : submittedDocTypes.length > 0 ? 'Incomplete' : 'Pending';
   const creditRiskReady = allDocsPresent && !!creditConsentAccepted;
+
+  // Retrieve the existing draft application for compliance checks & preservation
+  const draft = await LoanApplication.findOne({ borrowerId: req.user._id, idNumber: personal.idNumber, status: 'Draft' });
+  const aml = draft?.amlVerification || {};
+  const amlStatus = aml.verificationStatus || 'NOT_STARTED';
+
+  // DEV-ONLY sandbox testing mode bypass check
+  const { isDevelopmentSandboxBypassEnabled } = require('../utils/devSandboxBypass');
+  const isDevBypass = isDevelopmentSandboxBypassEnabled();
+
+  // If DEV TESTING MODE is false (Production compliance rules must be enforced)
+  if (!isDevBypass) {
+    const isAutoReject = amlStatus === 'AUTO_REJECT' || aml.complianceDecision === 'AUTO_REJECT';
+    const isHighRisk = amlStatus === 'HIGH_RISK';
+    const isOfacMatch = aml.ofacMatch === true;
+    const isSdnMatch = (aml.matchedEntities || []).some(entity =>
+      /SDN/i.test([entity.source, entity.program, entity.listName].filter(Boolean).join(' '))
+    );
+    const isTerrorMatch = aml.terrorMatch === true;
+
+    if (isAutoReject || isHighRisk || isOfacMatch || isSdnMatch || isTerrorMatch) {
+      return sendError(res, 'Application blocked due to compliance restrictions.', 403);
+    }
+  }
+
+  // Calculate final application audit status (Fix 3)
   let applicationAuditStatus = 'Incomplete';
-  if (creditRiskReady) applicationAuditStatus = 'Ready For Review';
-  else if (!allDocsPresent) applicationAuditStatus = 'Missing Documents';
-  else if (!creditConsentAccepted) applicationAuditStatus = 'Credit Consent Missing';
+  if (amlStatus === 'AUTO_REJECT' || amlStatus === 'HIGH_RISK' || aml.complianceDecision === 'AUTO_REJECT') {
+    applicationAuditStatus = 'APPLICATION BLOCKED';
+  } else if (amlStatus === 'MANUAL_REVIEW') {
+    applicationAuditStatus = 'MANUAL COMPLIANCE REVIEW REQUIRED';
+  } else if (amlStatus === 'CLEARED') {
+    applicationAuditStatus = 'READY FOR REVIEW STAGE';
+  } else {
+    if (creditRiskReady) applicationAuditStatus = 'Ready For Review';
+    else if (!allDocsPresent) applicationAuditStatus = 'Missing Documents';
+    else if (!creditConsentAccepted) applicationAuditStatus = 'Credit Consent Missing';
+  }
 
   // --- START TRANSACTION ---
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    // 1. Create Loan Application Record
-    const [application] = await LoanApplication.create([{
+    const appData = {
       borrowerId: req.user._id,
       fullName: personal.fullName,
       phoneNumber: personal.phoneNumber,
@@ -340,7 +377,18 @@ exports.submitFullApplication = asyncHandler(async (req, res, next) => {
       documentVerificationStatus,
       creditRiskReady,
       applicationAuditStatus,
-    }], { session });
+    };
+
+    let application;
+    if (draft) {
+      // Preserve existing draft so we don't lose the KYC, bureau, phone, bank and AML results!
+      Object.assign(draft, appData);
+      application = await draft.save({ session });
+    } else {
+      // Fallback: create fresh application
+      const [newApp] = await LoanApplication.create([appData], { session });
+      application = newApp;
+    }
 
     // 2. Create Related Records
     await LoanEmployment.create([{
@@ -476,4 +524,28 @@ exports.getApplicationStatus = asyncHandler(async (req, res, next) => {
     currentStatus: application.status,
     timeline: history
   });
+});
+
+// @desc    Persist document immediately
+// @route   POST /api/borrower/apply-loan/persist-document
+// @access  Protected
+exports.persistDocument = asyncHandler(async (req, res, next) => {
+  const { applicationId, type, url, fileId, fileName, fileSize } = req.body;
+  if (!applicationId || !type || !url) {
+    return sendError(res, 'applicationId, type, and url are required', 400);
+  }
+
+  // Remove existing document of same type for this application
+  await LoanDocument.deleteMany({ loanApplicationId: applicationId, documentType: type });
+
+  const doc = await LoanDocument.create({
+    loanApplicationId: applicationId,
+    documentType: type,
+    fileUrl: url,
+    fileId,
+    fileName,
+    fileSize
+  });
+
+  sendSuccess(res, 'Document persisted successfully', doc);
 });

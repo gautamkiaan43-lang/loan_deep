@@ -10,11 +10,39 @@ const AMLCheck = require('../models/AMLCheck');
 const BankVerification = require('../models/BankVerification');
 const Borrower = require('../models/Borrower');
 const LoanApplication = require('../models/LoanApplication');
+const SystemSettings = require('../models/SystemSettings');
 const { callProfileIdPhotoMatch } = require('../services/datanamix/profileIdPhotoVerification.service');
 const { callAddressPlusProfileIdv } = require('../services/datanamix/addressProfileIdv.service');
 const { callConsumerCreditSearch } = require('../services/datanamix/consumerCreditSearch.service');
 const { callConsumerCreditResult }  = require('../services/datanamix/consumerCreditResult.service');
+const { callPhoneVerification }     = require('../services/datanamix/phoneVerification.service');
+const { callBankVerification }      = require('../services/datanamix/bankVerification.service');
+const { callAMLVerification }       = require('../services/datanamix/amlVerification.service');
 const { getIO } = require('../socket/socketServer');
+const { isDevelopmentSandboxBypassEnabled } = require('../utils/devSandboxBypass');
+
+const validateSAPhone = (phone) => {
+  if (!phone) return false;
+  return /^0\d{9}$/.test(phone.trim());
+};
+
+const validateFullName = (name) => {
+  if (!name) return false;
+  const trimmed = name.trim().replace(/\s+/g, ' ');
+  const words = trimmed.split(' ').filter(Boolean);
+  if (words.length < 2) return false;
+  return /^[a-zA-Z\s]+$/.test(trimmed);
+};
+
+const formatFullName = (name) => {
+  if (!name) return '';
+  return name
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+};
 
 /**
  * Helper to log verification transactions to MongoDB VerificationLog collection
@@ -37,10 +65,19 @@ exports.verifyIdentityController = async (req, res) => {
   try {
     console.log(`👤 [Identity Verification Route Handled] - ID: ${idNumber}`);
 
+    if (!validateFullName(fullName)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Enter borrower full legal name.'
+      });
+    }
+
+    const formattedName = formatFullName(fullName);
+
     // Call integration module
     const result = await datanamix.identity.verifyIdentity({
       idNumber,
-      fullName,
+      fullName: formattedName,
       dateOfBirth,
       selfiePhotoBase64
     });
@@ -52,7 +89,7 @@ exports.verifyIdentityController = async (req, res) => {
       verificationType: 'IDV_PHOTO',
       status: 'SUCCESS',
       initiatedBy,
-      requestPayload: { idNumber, fullName, dateOfBirth },
+      requestPayload: { idNumber, fullName: formattedName, dateOfBirth },
       responsePayload: result
     });
 
@@ -71,7 +108,7 @@ exports.verifyIdentityController = async (req, res) => {
       verificationType: 'IDV_PHOTO',
       status: 'FAILED',
       initiatedBy,
-      requestPayload: { idNumber, fullName, dateOfBirth },
+      requestPayload: { idNumber, fullName: req.body.fullName ? formatFullName(req.body.fullName) : '', dateOfBirth },
       errorMessage: error.message
     });
 
@@ -271,10 +308,26 @@ exports.verifyPhoneController = async (req, res) => {
   try {
     console.log(`📱 [Phone Verification Route Handled] - Phone: ${phoneNumber}`);
 
+    if (!validateSAPhone(phoneNumber)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Enter a valid South African phone number.'
+      });
+    }
+
+    if (!validateFullName(fullName)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Enter borrower full legal name.'
+      });
+    }
+
+    const formattedName = formatFullName(fullName);
+
     const result = await datanamix.phone.verifyPhoneOwnership({
       phoneNumber,
       idNumber,
-      fullName
+      fullName: formattedName
     });
 
     await writeAuditLog({
@@ -283,7 +336,7 @@ exports.verifyPhoneController = async (req, res) => {
       verificationType: 'PHONE_CARRIER',
       status: 'SUCCESS',
       initiatedBy,
-      requestPayload: { phoneNumber, idNumber, fullName },
+      requestPayload: { phoneNumber, idNumber, fullName: formattedName },
       responsePayload: result
     });
 
@@ -301,7 +354,11 @@ exports.verifyPhoneController = async (req, res) => {
       verificationType: 'PHONE_CARRIER',
       status: 'FAILED',
       initiatedBy,
-      requestPayload: { phoneNumber, idNumber, fullName },
+      requestPayload: { 
+        phoneNumber, 
+        idNumber, 
+        fullName: req.body.fullName ? formatFullName(req.body.fullName) : '' 
+      },
       errorMessage: error.message
     });
 
@@ -525,6 +582,11 @@ exports.overrideKYCController = async (req, res) => {
   }
 
   try {
+    const settings = await SystemSettings.findOne();
+    if (settings && settings.manualOverrideAllowed === false) {
+      return res.status(403).json({ success: false, message: 'Manual override is not allowed under current system settings.' });
+    }
+
     const application = await LoanApplication.findById(applicationId);
     if (!application) {
       return res.status(404).json({ success: false, message: 'Application not found' });
@@ -608,10 +670,14 @@ exports.verifyAddressProfileController = async (req, res) => {
       if (app) {
         const kycStatus = app.kycVerification?.verificationStatus;
         if (!kycStatus || kycStatus === 'Pending' || kycStatus === 'Failed') {
-          return res.status(400).json({
-            success: false,
-            message: 'Biometric identity verification must be completed before bureau verification.',
-          });
+          if (isDevelopmentSandboxBypassEnabled()) {
+            console.warn('[DEV SANDBOX BYPASS] Bureau gate bypassed — KYC not verified.');
+          } else {
+            return res.status(400).json({
+              success: false,
+              message: 'Biometric identity verification must be completed before bureau verification.',
+            });
+          }
         }
       }
     }
@@ -819,7 +885,384 @@ exports.overrideBureauController = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 11. Consumer Credit Report Search (Step 2)
+// 11. Phone Verification — Contact To ID (Step 1.75)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/verification/phone-verification/:applicationId
+ * Requires KYC (step 1) Verified/Overridden and Bureau not Rejected.
+ * Body: { phoneNumber, idNumber, fullName }
+ */
+exports.verifyPhoneByApplicationController = async (req, res) => {
+  const { applicationId } = req.params;
+  const { phoneNumber, idNumber, fullName, borrowerId: bodyBorrowerId } = req.body;
+  const initiatedBy = req.user?._id;
+
+  if (!applicationId) return res.status(400).json({ success: false, message: 'applicationId is required' });
+  if (!phoneNumber)   return res.status(400).json({ success: false, message: 'phoneNumber is required' });
+  if (!idNumber)      return res.status(400).json({ success: false, message: 'idNumber is required' });
+
+  if (!validateSAPhone(phoneNumber)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Enter a valid South African phone number.'
+    });
+  }
+
+  try {
+    // ── Load application and enforce sequential gates ──────────────────────
+    const app = await LoanApplication.findById(applicationId)
+      .select('borrowerId kycVerification bureauVerification phoneNumber fullName');
+
+    if (!app) return res.status(404).json({ success: false, message: 'Application not found' });
+
+    const nameToUse = fullName || app.fullName || '';
+    if (!validateFullName(nameToUse)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Enter borrower full legal name.'
+      });
+    }
+
+    const formattedName = formatFullName(nameToUse);
+
+    const kycStatus    = app.kycVerification?.verificationStatus;
+    const bureauStatus = app.bureauVerification?.verificationStatus;
+
+    const kycPassed = kycStatus === 'Verified' || kycStatus === 'Overridden';
+    if (!kycPassed) {
+      if (isDevelopmentSandboxBypassEnabled()) {
+        console.warn('[DEV SANDBOX BYPASS] Phone verification gate bypassed — KYC not verified.');
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Biometric KYC verification must be completed before phone verification.',
+        });
+      }
+    }
+
+    if (bureauStatus === 'Rejected') {
+      if (isDevelopmentSandboxBypassEnabled()) {
+        console.warn('[DEV SANDBOX BYPASS] Phone verification gate bypassed — bureau rejected.');
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Bureau verification has fatal indicators. Phone verification cannot proceed.',
+        });
+      }
+    }
+
+    const borrowerId = bodyBorrowerId || app.borrowerId || initiatedBy;
+
+    console.log(`[PHONE Controller] Starting phone verification — Phone: ${phoneNumber} | App: ${applicationId}`);
+
+    // ── Call Datanamix Contact To ID API ──────────────────────────────────
+    const result = await callPhoneVerification({
+      phoneNumber,
+      idNumber,
+      fullName:        formattedName,
+      clientReference: applicationId,
+    });
+
+    // ── Persist to LoanApplication ─────────────────────────────────────────
+    await LoanApplication.findByIdAndUpdate(applicationId, {
+      'phoneVerification.verificationStatus':  result.verificationStatus,
+      'phoneVerification.verifiedPhoneNumber': result.verifiedPhoneNumber,
+      'phoneVerification.reportReference':     result.reportReference,
+      'phoneVerification.ownershipMatched':    result.ownershipMatched,
+      'phoneVerification.mismatchDetected':    result.mismatchDetected,
+      'phoneVerification.mismatchReason':      result.mismatchReason,
+      'phoneVerification.matchedConsumers':    result.matchedConsumers,
+      'phoneVerification.verifiedAt':          new Date(),
+      'phoneVerification.rawResponse':         result.rawResponse,
+    });
+
+    // ── Audit log ──────────────────────────────────────────────────────────
+    await writeAuditLog({
+      borrowerId,
+      applicationId,
+      verificationType: result.verificationStatus === 'Verified' ? 'PHONE_VERIFICATION' : 'PHONE_VERIFICATION_FAILED',
+      status:           result.verificationStatus === 'Verified' ? 'SUCCESS' : 'FAILED',
+      initiatedBy,
+      requestPayload:  { phoneNumber, idNumber, applicationId },
+      responsePayload: {
+        verificationStatus: result.verificationStatus,
+        ownershipMatched:   result.ownershipMatched,
+        mismatchDetected:   result.mismatchDetected,
+        mismatchReason:     result.mismatchReason,
+        reportReference:    result.reportReference,
+      },
+    });
+
+    // ── Socket events ──────────────────────────────────────────────────────
+    try {
+      const io   = getIO();
+      const room = borrowerId?.toString();
+
+      if (result.verificationStatus === 'Verified') {
+        io.to(room).emit('phone-verification-completed', {
+          applicationId,
+          ownershipMatched: result.ownershipMatched,
+          mismatchDetected: result.mismatchDetected,
+          message: result.mismatchDetected
+            ? 'Phone verified with partial name match — please review'
+            : 'Phone number ownership verified successfully',
+        });
+      } else {
+        io.to(room).emit('phone-verification-failed', {
+          applicationId,
+          mismatchReason: result.mismatchReason,
+          message: result.mismatchReason || 'Phone verification failed',
+        });
+      }
+    } catch {
+      // Socket not initialized — non-fatal
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: result.verificationStatus === 'Verified'
+        ? result.mismatchDetected
+          ? 'Phone verified with partial name match'
+          : 'Phone number ownership verified successfully'
+        : result.mismatchReason || 'Phone verification failed',
+      data: {
+        verificationStatus:  result.verificationStatus,
+        ownershipMatched:    result.ownershipMatched,
+        mismatchDetected:    result.mismatchDetected,
+        mismatchReason:      result.mismatchReason,
+        verifiedPhoneNumber: result.verifiedPhoneNumber,
+        reportReference:     result.reportReference,
+        matchedConsumers:    result.matchedConsumers,
+      },
+    });
+  } catch (error) {
+    console.error('[PHONE Controller Error]:', error.message);
+
+    const failApp = await LoanApplication.findById(applicationId).select('borrowerId').catch(() => null);
+    const fallbackBorrowerId = failApp?.borrowerId || initiatedBy;
+
+    await writeAuditLog({
+      borrowerId:       fallbackBorrowerId,
+      applicationId,
+      verificationType: 'PHONE_VERIFICATION_FAILED',
+      status:           'ERROR',
+      initiatedBy,
+      requestPayload:   { phoneNumber, idNumber, applicationId },
+      errorMessage:     error.message,
+    });
+
+    return res.status(error.response?.status || 500).json({
+      success: false,
+      message: error.response?.data?.message || error.message || 'Phone verification failed',
+    });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Bank Account Verification — AVS Advanced (Step 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/verification/bank-verification/:applicationId
+ * Requires KYC (step 1) Verified/Overridden and Bureau not Rejected.
+ * Body: { accountHolder, bankName, accountNumber, branchCode, accountType,
+ *         phoneNumber, emailAddress, idNumber }
+ */
+exports.verifyBankVerificationController = async (req, res) => {
+  const { applicationId } = req.params;
+  const {
+    accountHolder, bankName, accountNumber, branchCode,
+    accountType, phoneNumber, emailAddress, idNumber,
+    borrowerId: bodyBorrowerId,
+  } = req.body;
+  const initiatedBy = req.user?._id;
+
+  if (!applicationId) return res.status(400).json({ success: false, message: 'applicationId is required' });
+  if (!accountNumber) return res.status(400).json({ success: false, message: 'accountNumber is required' });
+  if (!idNumber)      return res.status(400).json({ success: false, message: 'idNumber is required' });
+
+  try {
+    const app = await LoanApplication.findById(applicationId)
+      .select('borrowerId fullName idNumber phoneNumber emailAddress kycVerification bureauVerification');
+
+    if (!app) return res.status(404).json({ success: false, message: 'Application not found' });
+
+    const kycStatus    = app.kycVerification?.verificationStatus;
+    const bureauStatus = app.bureauVerification?.verificationStatus;
+
+    const kycPassed = kycStatus === 'Verified' || kycStatus === 'Overridden';
+    if (!kycPassed) {
+      if (isDevelopmentSandboxBypassEnabled()) {
+        console.warn('[DEV SANDBOX BYPASS] Bank verification gate bypassed — KYC not verified.');
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Biometric KYC verification must be completed before bank verification.',
+        });
+      }
+    }
+
+    if (bureauStatus === 'Rejected') {
+      if (isDevelopmentSandboxBypassEnabled()) {
+        console.warn('[DEV SANDBOX BYPASS] Bank verification gate bypassed — bureau rejected.');
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Bureau verification has fatal indicators. Bank verification cannot proceed.',
+        });
+      }
+    }
+
+    const borrowerId = bodyBorrowerId || app.borrowerId || initiatedBy;
+
+    // Identity resolution:
+    // - idNumber / phoneNumber / emailAddress: body (current form) takes priority — DB is fallback only
+    //   because the draft application may have been created with older values
+    // - fullName: from DB because the banking step form has no name field
+    const borrowerFullName  = app.fullName       || '';
+    const borrowerIdNumber  = idNumber           || app.idNumber      || '';
+    const borrowerPhone     = phoneNumber        || app.phoneNumber   || '';
+    const borrowerEmail     = emailAddress       || app.emailAddress  || '';
+
+    console.log('[BANK VERIFY SOURCE DATA]', {
+      source_body:  { idNumber, phoneNumber, emailAddress },
+      source_db:    { idNumber: app.idNumber, phoneNumber: app.phoneNumber, emailAddress: app.emailAddress, fullName: app.fullName },
+      resolved:     { fullName: borrowerFullName, idNumber: borrowerIdNumber, phoneNumber: borrowerPhone, email: borrowerEmail },
+    });
+    console.log(`[BANK Controller] Starting AVS Advanced — Account: ${accountNumber} | App: ${applicationId} | ID: ${borrowerIdNumber} | Name: ${borrowerFullName}`);
+
+    const result = await callBankVerification({
+      fullName:     borrowerFullName,
+      bankName,
+      accountNumber,
+      branchCode,
+      accountType,
+      phoneNumber:  borrowerPhone,
+      emailAddress: borrowerEmail,
+      idNumber:     borrowerIdNumber,
+      clientReference: applicationId,
+    });
+
+    // ── Persist to LoanApplication ─────────────────────────────────────────
+    await LoanApplication.findByIdAndUpdate(applicationId, {
+      'bankVerification.verificationStatus':  result.verificationStatus,
+      'bankVerification.statusMessage':       result.statusMessage,
+      'bankVerification.accountFound':        result.avs?.accountFound,
+      'bankVerification.accountOpen':         result.avs?.accountOpen,
+      'bankVerification.acceptsCredits':      result.avs?.acceptsCredits,
+      'bankVerification.identityMatch':       result.avs?.identityMatch,
+      'bankVerification.accountTypeMatch':    result.avs?.accountTypeMatch,
+      'bankVerification.initialsMatch':       result.avs?.initialsMatch,
+      'bankVerification.nameMatch':           result.avs?.nameMatch,
+      'bankVerification.emailMatch':          result.avs?.emailMatch,
+      'bankVerification.phoneMatch':          result.avs?.phoneMatch,
+      'bankVerification.bankReference':       result.avs?.bankReference,
+      'bankVerification.bankStatusCode':      result.avs?.bankStatusCode,
+      'bankVerification.bankStatusMessage':   result.avs?.bankStatusMessage,
+      'bankVerification.reportReference':     result.reportReference,
+      'bankVerification.verifiedAt':          new Date(),
+      'bankVerification.verifiedBankAccount': result.verifiedBankAccount,
+      'bankVerification.verifiedBranchCode':  result.verifiedBranchCode,
+      'bankVerification.verifiedAccountType': result.verifiedAccountType,
+      'bankVerification.pdfReport':           result.pdfReport,
+      'bankVerification.rawResponse':         result.rawResponse,
+    });
+
+    // ── Audit log ──────────────────────────────────────────────────────────
+    await writeAuditLog({
+      borrowerId,
+      applicationId,
+      verificationType: result.verificationStatus === 'Rejected' ? 'BANK_VERIFICATION_FAILED' : 'BANK_VERIFICATION',
+      status:           result.verificationStatus === 'Rejected' ? 'FAILED' : 'SUCCESS',
+      initiatedBy,
+      requestPayload:  { accountNumber, idNumber, applicationId },
+      responsePayload: {
+        verificationStatus: result.verificationStatus,
+        statusMessage:      result.statusMessage,
+        accountFound:       result.avs?.accountFound,
+        accountOpen:        result.avs?.accountOpen,
+        identityMatch:      result.avs?.identityMatch,
+        reportReference:    result.reportReference,
+      },
+    });
+
+    // ── Socket events ──────────────────────────────────────────────────────
+    try {
+      const io   = getIO();
+      const room = borrowerId?.toString();
+
+      if (result.verificationStatus === 'Verified') {
+        io.to(room).emit('bank-verification-completed', {
+          applicationId,
+          message: 'Bank account ownership verified successfully',
+        });
+      } else if (result.verificationStatus === 'VerifiedWithWarnings') {
+        io.to(room).emit('bank-verification-warning', {
+          applicationId,
+          message: result.statusMessage,
+        });
+      } else {
+        io.to(room).emit('bank-verification-failed', {
+          applicationId,
+          message: result.statusMessage,
+        });
+      }
+    } catch {
+      // Socket not initialized — non-fatal
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: result.statusMessage || (result.verificationStatus === 'Verified'
+        ? 'Bank account ownership verified successfully'
+        : result.verificationStatus === 'VerifiedWithWarnings'
+          ? 'Bank account verified with minor data mismatches'
+          : 'Bank account verification failed'),
+      data: {
+        verificationStatus:  result.verificationStatus,
+        statusMessage:       result.statusMessage,
+        accountFound:        result.avs?.accountFound,
+        accountOpen:         result.avs?.accountOpen,
+        acceptsCredits:      result.avs?.acceptsCredits,
+        identityMatch:       result.avs?.identityMatch,
+        accountTypeMatch:    result.avs?.accountTypeMatch,
+        initialsMatch:       result.avs?.initialsMatch,
+        nameMatch:           result.avs?.nameMatch,
+        emailMatch:          result.avs?.emailMatch,
+        phoneMatch:          result.avs?.phoneMatch,
+        bankReference:       result.avs?.bankReference,
+        reportReference:     result.reportReference,
+        verifiedBankAccount: result.verifiedBankAccount,
+        verifiedBranchCode:  result.verifiedBranchCode,
+        verifiedAccountType: result.verifiedAccountType,
+      },
+    });
+  } catch (error) {
+    console.error('[BANK Controller Error]:', error.message);
+
+    const failApp = await LoanApplication.findById(applicationId).select('borrowerId').catch(() => null);
+    const fallbackBorrowerId = failApp?.borrowerId || initiatedBy;
+
+    await writeAuditLog({
+      borrowerId:       fallbackBorrowerId,
+      applicationId,
+      verificationType: 'BANK_VERIFICATION_FAILED',
+      status:           'ERROR',
+      initiatedBy,
+      requestPayload:   { accountNumber, idNumber, applicationId },
+      errorMessage:     error.message,
+    });
+
+    return res.status(error.response?.status || 500).json({
+      success: false,
+      message: error.response?.data?.message || error.message || 'Bank verification failed',
+    });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Consumer Credit Report Search (Step 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -839,25 +1282,45 @@ exports.runCreditAssessmentController = async (req, res) => {
     // ── Guard: KYC and bureau must be completed ────────────────────────────
     if (applicationId) {
       const app = await LoanApplication.findById(applicationId)
-        .select('kycVerification bureauVerification');
+        .select('kycVerification bureauVerification phoneVerification');
 
       if (app) {
         const kycStatus    = app.kycVerification?.verificationStatus;
         const bureauStatus = app.bureauVerification?.verificationStatus;
+        const phoneStatus  = app.phoneVerification?.verificationStatus;
 
         const kycPassed = kycStatus === 'Verified' || kycStatus === 'Overridden';
         if (!kycPassed) {
-          return res.status(400).json({
-            success: false,
-            message: 'Biometric KYC verification must be completed before running credit assessment.',
-          });
+          if (isDevelopmentSandboxBypassEnabled()) {
+            console.warn('[DEV SANDBOX BYPASS] Credit progression allowed — KYC not verified.');
+          } else {
+            return res.status(400).json({
+              success: false,
+              message: 'Biometric KYC verification must be completed before running credit assessment.',
+            });
+          }
         }
 
         if (bureauStatus === 'Rejected') {
-          return res.status(400).json({
-            success: false,
-            message: 'Bureau verification has fatal indicators. Credit assessment cannot proceed.',
-          });
+          if (isDevelopmentSandboxBypassEnabled()) {
+            console.warn('[DEV SANDBOX BYPASS] Credit progression allowed — bureau rejected.');
+          } else {
+            return res.status(400).json({
+              success: false,
+              message: 'Bureau verification has fatal indicators. Credit assessment cannot proceed.',
+            });
+          }
+        }
+
+        if (!phoneStatus || phoneStatus === 'Pending' || phoneStatus === 'Failed' || phoneStatus === 'Rejected') {
+          if (isDevelopmentSandboxBypassEnabled()) {
+            console.warn('[DEV SANDBOX BYPASS] Credit progression allowed — phone verification not completed.');
+          } else {
+            return res.status(400).json({
+              success: false,
+              message: 'Phone verification must be completed before running credit assessment.',
+            });
+          }
         }
       }
     }
@@ -1041,10 +1504,14 @@ exports.fetchConsumerCreditReportController = async (req, res) => {
     const kycStatus = app.kycVerification?.verificationStatus;
     const kycPassed = kycStatus === 'Verified' || kycStatus === 'Overridden';
     if (!kycPassed) {
-      return res.status(400).json({
-        success: false,
-        message: 'Biometric KYC verification must be completed before fetching the credit report.',
-      });
+      if (isDevelopmentSandboxBypassEnabled()) {
+        console.warn('[DEV SANDBOX BYPASS] Credit report fetch allowed — KYC not verified.');
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Biometric KYC verification must be completed before fetching the credit report.',
+        });
+      }
     }
 
     const creditSearch = app.creditAssessment;
@@ -1182,6 +1649,194 @@ exports.fetchConsumerCreditReportController = async (req, res) => {
     return res.status(error.response?.status || 500).json({
       success: false,
       message: error.response?.data?.message || error.message || 'Failed to fetch consumer credit report',
+    });
+  }
+ };
+
+/**
+ * 14. AML & Sanctions screening controller for loan application review
+ * POST /api/verification/aml-screening/:applicationId
+ */
+exports.verifyAMLScreeningController = async (req, res) => {
+  const { applicationId } = req.params;
+  const initiatedBy = req.user ? req.user._id : null;
+
+  if (!applicationId) {
+    return res.status(400).json({ success: false, message: 'applicationId is required' });
+  }
+
+  // 1. Log incoming req.body
+  console.log('[AML SOURCE DATA]:', req.body);
+
+  // 2. Validate required fields & 3. Reject empty payloads
+  if (!req.body || Object.keys(req.body).length === 0 || !req.body.fullName || !req.body.idNumber) {
+    return res.status(400).json({
+      success: false,
+      message: "Missing required AML screening fields"
+    });
+  }
+
+  const { fullName, idNumber } = req.body;
+
+  try {
+    const app = await LoanApplication.findById(applicationId);
+    if (!app) {
+      return res.status(404).json({ success: false, message: 'Application not found' });
+    }
+
+    const borrowerId = app.borrowerId || initiatedBy;
+    const room = borrowerId?.toString();
+
+    // Socket: AML_STARTED
+    try {
+      const io = getIO();
+      io.to(room).emit('AML_STARTED', { applicationId, message: 'AML & Sanctions watchlist screening started.' });
+    } catch (e) {}
+
+    console.log(`[AML Controller] Screening starting for application: ${applicationId} | Borrower: ${fullName}`);
+
+    // Update status to VERIFYING in DB
+    await LoanApplication.findByIdAndUpdate(applicationId, {
+      'amlVerification.verificationStatus': 'VERIFYING'
+    });
+
+    // 4. Generate proper Datanamix request payload (handled inside callAMLVerification)
+    const result = await callAMLVerification({
+      idNumber: idNumber.trim(),
+      fullName: fullName.trim(),
+      clientReference: applicationId
+    });
+
+    // Save details inside LoanApplication model
+    await LoanApplication.findByIdAndUpdate(applicationId, {
+      'amlVerification.verificationStatus': result.verificationStatus,
+      'amlVerification.amlScore': result.amlScore,
+      'amlVerification.found': result.found,
+      'amlVerification.pepMatch': result.pepMatch,
+      'amlVerification.sanctionsMatch': result.sanctionsMatch,
+      'amlVerification.terrorMatch': result.terrorMatch,
+      'amlVerification.fraudMatch': result.fraudMatch,
+      'amlVerification.adverseMediaMatch': result.adverseMediaMatch,
+      'amlVerification.ofacMatch': result.ofacMatch,
+      'amlVerification.fatfMatch': result.fatfMatch,
+      'amlVerification.riskLevel': result.riskLevel,
+      'amlVerification.riskReason': result.riskReason,
+      'amlVerification.reportReference': result.reportReference,
+      'amlVerification.clientReference': result.clientReference,
+      'amlVerification.matchCount': result.matchCount,
+      'amlVerification.matchedEntities': result.matchedEntities,
+      'amlVerification.screeningDate': result.screeningDate,
+      'amlVerification.rawResponse': result.rawResponse,
+      'amlVerification.pdfReport': result.pdfReport,
+      'amlVerification.sanctionsStatus': result.sanctionsStatus,
+      'amlVerification.complianceDecision': result.complianceDecision,
+      'amlVerification.isBlocked': result.isBlocked,
+      'amlVerification.screeningTimestamp': result.screeningTimestamp
+    });
+
+    // Store AML results in AMLCheck collection
+    await AMLCheck.create({
+      borrowerId,
+      pepStatusDetected: result.pepMatch || false,
+      sanctionStatusDetected: result.sanctionsMatch || false,
+      crimeRecordDetected: result.terrorMatch || result.fraudMatch || false,
+      riskScore: result.amlScore || 0,
+      matchDetails: (result.matchedEntities || []).map(m => ({
+        listName: m.source,
+        matchedName: m.matchName,
+        matchConfidence: m.confidenceScore,
+        details: m
+      })),
+      screeningRawResponse: result.rawResponse || {},
+      screeningDate: result.screeningDate || new Date(),
+      complianceOutcome: result.verificationStatus === 'CLEARED' ? 'PASSED' : (result.complianceDecision === 'AUTO_REJECT' ? 'FAILED' : 'REFERRED'),
+      notes: result.riskReason
+    });
+
+    await writeAuditLog({
+      borrowerId,
+      applicationId,
+      verificationType: result.verificationStatus === 'FAILED' ? 'AML_SCREENING_FAILED' : 'AML_SCREENING',
+      status: result.verificationStatus === 'FAILED' ? 'FAILED' : 'SUCCESS',
+      initiatedBy,
+      requestPayload: { idNumber: app.idNumber, fullName: app.fullName, applicationId },
+      responsePayload: {
+        verificationStatus: result.verificationStatus,
+        riskLevel: result.riskLevel,
+        matchCount: result.matchCount,
+        reportReference: result.reportReference
+      }
+    });
+
+    try {
+      const io = getIO();
+      if (result.complianceDecision === 'AUTO_REJECT' || result.verificationStatus === 'AUTO_REJECT' || result.verificationStatus === 'HIGH_RISK') {
+        io.to(room).emit('AML_HIGH_RISK', {
+          applicationId,
+          message: 'FATAL COMPLIANCE RISK: Borrower matched against restricted sanctions or terror databases.',
+          riskReason: result.riskReason
+        });
+      } else if (result.verificationStatus === 'FAILED') {
+        io.to(room).emit('AML_FAILED', {
+          applicationId,
+          message: 'AML watchlists screening failed. Please retry.'
+        });
+      } else {
+        io.to(room).emit('AML_COMPLETED', {
+          applicationId,
+          verificationStatus: result.verificationStatus,
+          riskLevel: result.riskLevel,
+          matchCount: result.matchCount,
+          message: 'AML watchlists screening completed successfully.'
+        });
+      }
+    } catch (e) {}
+
+    return res.status(200).json({
+      success: true,
+      message: `AML watchlists screening completed with status: ${result.verificationStatus}`,
+      data: {
+        verificationStatus: result.verificationStatus,
+        riskLevel: result.riskLevel,
+        found: result.found,
+        matchCount: result.matchCount,
+        reportReference: result.reportReference,
+        riskReason: result.riskReason,
+        matchedEntities: result.matchedEntities,
+        amlScore: result.amlScore,
+        complianceDecision: result.complianceDecision,
+        sanctionsStatus: result.sanctionsStatus,
+        isBlocked: result.isBlocked,
+        ofacMatch: result.ofacMatch,
+        sanctionsMatch: result.sanctionsMatch,
+        terrorMatch: result.terrorMatch,
+        pepMatch: result.pepMatch,
+        fatfMatch: result.fatfMatch,
+        adverseMediaMatch: result.adverseMediaMatch
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ [AML Controller Error]:', error.message);
+
+    await writeAuditLog({
+      borrowerId: req.user?._id || initiatedBy,
+      applicationId,
+      verificationType: 'AML_SCREENING_FAILED',
+      status: 'FAILED',
+      initiatedBy,
+      requestPayload: { applicationId },
+      errorMessage: error.message
+    });
+
+    try {
+      const io = getIO();
+      io.to(initiatedBy?.toString()).emit('AML_FAILED', { applicationId, message: error.message });
+    } catch (e) {}
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Error occurred during AML screening.'
     });
   }
 };
