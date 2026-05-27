@@ -4,6 +4,7 @@
  */
 
 const datanamix = require('../integrations/datanamix');
+const { generateVerificationHash } = require('../utils/verificationHashEngine');
 const VerificationLog = require('../models/VerificationLog');
 const CreditReport = require('../models/CreditReport');
 const AMLCheck = require('../models/AMLCheck');
@@ -19,7 +20,7 @@ const { callPhoneVerification }     = require('../services/datanamix/phoneVerifi
 const { callBankVerification }      = require('../services/datanamix/bankVerification.service');
 const { callAMLVerification }       = require('../services/datanamix/amlVerification.service');
 const { getIO } = require('../socket/socketServer');
-const { isDevelopmentSandboxBypassEnabled } = require('../utils/devSandboxBypass');
+const { isDevelopmentSandboxBypassEnabled, isDevelopmentNextStepBypassEnabled } = require('../utils/devSandboxBypass');
 
 const validateSAPhone = (phone) => {
   if (!phone) return false;
@@ -1084,7 +1085,7 @@ exports.verifyBankVerificationController = async (req, res) => {
 
   try {
     const app = await LoanApplication.findById(applicationId)
-      .select('borrowerId fullName idNumber phoneNumber emailAddress kycVerification bureauVerification');
+      .select('borrowerId fullName idNumber phoneNumber emailAddress kycVerification bureauVerification bankVerification staffReview creditAssessment status');
 
     if (!app) return res.status(404).json({ success: false, message: 'Application not found' });
 
@@ -1116,6 +1117,9 @@ exports.verifyBankVerificationController = async (req, res) => {
 
     const borrowerId = bodyBorrowerId || app.borrowerId || initiatedBy;
 
+    // Load dynamic settings from SystemSettings
+    const settings = await SystemSettings.findOne() || {};
+
     // Identity resolution:
     // - idNumber / phoneNumber / emailAddress: body (current form) takes priority — DB is fallback only
     //   because the draft application may have been created with older values
@@ -1144,10 +1148,78 @@ exports.verifyBankVerificationController = async (req, res) => {
       clientReference: applicationId,
     });
 
+    // ── PDF Archiving & Hashing ─────────────────────────────────────────────
+    let pdfReportPath = '';
+    let pdfHash = '';
+    let verificationVersion = 1;
+
+    if (result.pdfReport && settings.bankPdfGenerationMode !== 'JSON_ONLY') {
+      try {
+        const pdfBuffer = Buffer.from(result.pdfReport, 'base64');
+        const crypto = require('crypto');
+        pdfHash = crypto.createHash('sha256').update(pdfBuffer).digest('hex');
+
+        // Increment version number
+        verificationVersion = (app.bankVerification?.verificationVersion || 0) + 1;
+
+        const path = require('path');
+        const fs = require('fs/promises');
+
+        // Save PDF to storage/bureau-reports/<applicationId>/bank-verification/v<version>/report.pdf
+        const storageDir = path.join(__dirname, '..', '..', 'storage', 'bureau-reports', applicationId.toString(), 'bank-verification', `v${verificationVersion}`);
+        await fs.mkdir(storageDir, { recursive: true });
+
+        const filePath = path.join(storageDir, 'report.pdf');
+        await fs.writeFile(filePath, pdfBuffer);
+
+        // Store relative path in DB
+        pdfReportPath = path.join('storage', 'bureau-reports', applicationId.toString(), 'bank-verification', `v${verificationVersion}`, 'report.pdf');
+        console.log(`[COMPLIANCE-AVS] Saved encrypted AVS PDF successfully to ${filePath} with hash: ${pdfHash}`);
+      } catch (pdfErr) {
+        console.error('⚠️ [COMPLIANCE-AVS ERROR] Storing bank verification PDF failed:', pdfErr.message);
+      }
+    }
+
+    // Clean raw response before saving to MongoDB to prevent bloating
+    if (result.pdfReport) result.pdfReport = undefined;
+    if (result.rawResponse) {
+      if (result.rawResponse.PDFReport) result.rawResponse.PDFReport = undefined;
+      if (result.rawResponse.pdfReport) result.rawResponse.pdfReport = undefined;
+    }
+
+    // ── Auto Underwriting & Compliance Engine Linkage ───────────────────────
+    let underwritingDecision = app.creditAssessment?.underwritingDecision || 'Auto Approve';
+    let workflowRoute        = app.creditAssessment?.workflowRoute || 'Auto Approval Engine';
+    let riskLevel            = app.staffReview?.riskLevel || 'Low';
+    let appStatus            = app.status;
+
+    const identityMatch = result.avs?.identityMatch;
+    const accountOpen    = result.avs?.accountOpen;
+    const verificationStatus = result.verificationStatus;
+
+    if (identityMatch === 'No') {
+      underwritingDecision = 'Decline';
+      workflowRoute        = 'Rejection Desk';
+      riskLevel            = 'Critical';
+      appStatus            = 'Rejected';
+    } else if (accountOpen === 'No') {
+      underwritingDecision = 'Manual Review Required';
+      riskLevel            = 'High';
+      if (appStatus !== 'Rejected') appStatus = 'Pending Review';
+    } else if (verificationStatus === 'VERIFIED_WITH_WARNINGS') {
+      underwritingDecision = 'Manual Review Required';
+      riskLevel            = 'Medium';
+      workflowRoute        = 'Manual Review Queue';
+      if (appStatus !== 'Rejected') appStatus = 'Pending Review';
+    }
+
     // ── Persist to LoanApplication ─────────────────────────────────────────
-    await LoanApplication.findByIdAndUpdate(applicationId, {
+    const updatedFields = {
       'bankVerification.verificationStatus':  result.verificationStatus,
+      'bankVerification.status':              result.verificationStatus,
+      'bankVerification.avsStatus':           result.avsStatus || result.verificationStatus,
       'bankVerification.statusMessage':       result.statusMessage,
+      'bankVerification.verificationLevel':   riskLevel,
       'bankVerification.accountFound':        result.avs?.accountFound,
       'bankVerification.accountOpen':         result.avs?.accountOpen,
       'bankVerification.acceptsCredits':      result.avs?.acceptsCredits,
@@ -1162,28 +1234,60 @@ exports.verifyBankVerificationController = async (req, res) => {
       'bankVerification.bankStatusMessage':   result.avs?.bankStatusMessage,
       'bankVerification.reportReference':     result.reportReference,
       'bankVerification.verifiedAt':          new Date(),
+      'bankVerification.verificationTimestamp': result.verificationTimestamp || new Date(),
       'bankVerification.verifiedBankAccount': result.verifiedBankAccount,
       'bankVerification.verifiedBranchCode':  result.verifiedBranchCode,
       'bankVerification.verifiedAccountType': result.verifiedAccountType,
-      'bankVerification.pdfReport':           result.pdfReport,
+      'bankVerification.pdfReport':           undefined,
+      'bankVerification.pdfReportPath':       pdfReportPath,
+      'bankVerification.pdfHash':             pdfHash,
+      'bankVerification.verificationVersion':  verificationVersion,
       'bankVerification.rawResponse':         result.rawResponse,
-    });
+      'bankVerification.verifiedBy':          initiatedBy || app.borrowerId,
+      'bankVerification.fraudIndicators':     identityMatch === 'No' ? ['IDENTITY_MISMATCH'] : [],
+      'bankVerification.mismatchFlags':        [
+        result.avs?.initialsMatch === 'No' ? 'INITIALS_MISMATCH' : null,
+        result.avs?.phoneMatch === 'No' ? 'PHONE_MISMATCH' : null,
+        result.avs?.emailMatch === 'No' ? 'EMAIL_MISMATCH' : null,
+      ].filter(Boolean),
+      'bankVerification.sandboxBypassEnabled': isDevelopmentSandboxBypassEnabled(),
+      'bankVerification.environmentType':      settings.bankVerificationEnvironment || 'SANDBOX',
+      'bankVerification.bypassReason':         isDevelopmentSandboxBypassEnabled() ? 'Sandbox test bypass active' : undefined,
+      'bankVerification.bypassActivatedAt':    isDevelopmentSandboxBypassEnabled() ? new Date() : undefined,
 
-    // ── Audit log ──────────────────────────────────────────────────────────
+      // Underwriting updates
+      'creditAssessment.underwritingDecision': underwritingDecision,
+      'creditAssessment.riskSeverity':         riskLevel,
+      'creditAssessment.workflowRoute':        workflowRoute,
+      underwritingDecision,
+      workflowRoute,
+      status:                                  appStatus,
+      'staffReview.riskLevel':                 riskLevel,
+    };
+
+    await LoanApplication.findByIdAndUpdate(applicationId, updatedFields);
+
+    const isAuditSuccess = ['VERIFIED', 'VERIFIED_WITH_WARNINGS', 'Verified', 'VerifiedWithWarnings'].includes(result.verificationStatus);
+
+    // ── Immutable Audit Log ────────────────────────────────────────────────
     await writeAuditLog({
       borrowerId,
       applicationId,
-      verificationType: result.verificationStatus === 'Rejected' ? 'BANK_VERIFICATION_FAILED' : 'BANK_VERIFICATION',
-      status:           result.verificationStatus === 'Rejected' ? 'FAILED' : 'SUCCESS',
+      verificationType: isAuditSuccess ? 'BANK_VERIFICATION' : 'BANK_VERIFICATION_FAILED',
+      status:           isAuditSuccess ? 'SUCCESS' : 'FAILED',
       initiatedBy,
       requestPayload:  { accountNumber, idNumber, applicationId },
       responsePayload: {
-        verificationStatus: result.verificationStatus,
-        statusMessage:      result.statusMessage,
-        accountFound:       result.avs?.accountFound,
-        accountOpen:        result.avs?.accountOpen,
-        identityMatch:      result.avs?.identityMatch,
-        reportReference:    result.reportReference,
+        verificationStatus:     result.verificationStatus,
+        statusMessage:          result.statusMessage,
+        accountFound:           result.avs?.accountFound,
+        accountOpen:            result.avs?.accountOpen,
+        identityMatch:          result.avs?.identityMatch,
+        reportReference:        result.reportReference,
+        pdfVersion:             verificationVersion,
+        pdfHash:                pdfHash,
+        underwritingDecision:   underwritingDecision,
+        riskLevel:              riskLevel
       },
     });
 
@@ -1192,12 +1296,12 @@ exports.verifyBankVerificationController = async (req, res) => {
       const io   = getIO();
       const room = borrowerId?.toString();
 
-      if (result.verificationStatus === 'Verified') {
+      if (result.verificationStatus === 'Verified' || result.verificationStatus === 'VERIFIED') {
         io.to(room).emit('bank-verification-completed', {
           applicationId,
           message: 'Bank account ownership verified successfully',
         });
-      } else if (result.verificationStatus === 'VerifiedWithWarnings') {
+      } else if (result.verificationStatus === 'VerifiedWithWarnings' || result.verificationStatus === 'VERIFIED_WITH_WARNINGS') {
         io.to(room).emit('bank-verification-warning', {
           applicationId,
           message: result.statusMessage,
@@ -1208,15 +1312,15 @@ exports.verifyBankVerificationController = async (req, res) => {
           message: result.statusMessage,
         });
       }
-    } catch {
+    } catch (e) {
       // Socket not initialized — non-fatal
     }
 
     return res.status(200).json({
       success: true,
-      message: result.statusMessage || (result.verificationStatus === 'Verified'
+      message: result.statusMessage || (['Verified', 'VERIFIED'].includes(result.verificationStatus)
         ? 'Bank account ownership verified successfully'
-        : result.verificationStatus === 'VerifiedWithWarnings'
+        : ['VerifiedWithWarnings', 'VERIFIED_WITH_WARNINGS'].includes(result.verificationStatus)
           ? 'Bank account verified with minor data mismatches'
           : 'Bank account verification failed'),
       data: {
@@ -1235,7 +1339,16 @@ exports.verifyBankVerificationController = async (req, res) => {
         reportReference:     result.reportReference,
         verifiedBankAccount: result.verifiedBankAccount,
         verifiedBranchCode:  result.verifiedBranchCode,
-        verifiedAccountType: result.verifiedAccountType,
+      verifiedAccountType: result.verifiedAccountType,
+        pdfReportPath,
+        pdfHash,
+        verificationVersion,
+        underwritingDecision,
+        riskSeverity:        riskLevel,
+        sandboxBypassEnabled: isDevelopmentSandboxBypassEnabled(),
+        environmentType:      settings.bankVerificationEnvironment || 'SANDBOX',
+        bypassReason:         isDevelopmentSandboxBypassEnabled() ? 'Sandbox test bypass active' : undefined,
+        bypassActivatedAt:    isDevelopmentSandboxBypassEnabled() ? new Date() : undefined,
       },
     });
   } catch (error) {
@@ -1272,17 +1385,38 @@ exports.verifyBankVerificationController = async (req, res) => {
  */
 exports.runCreditAssessmentController = async (req, res) => {
   const initiatedBy = req.user?._id;
-  const { applicationId, idNumber, passportNumber, borrowerId: bodyBorrowerId } = req.body;
+  const { applicationId, idNumber, passportNumber, borrowerId: bodyBorrowerId, affordability: affordabilityBody } = req.body;
 
   const borrowerId = bodyBorrowerId || initiatedBy;
 
   if (!idNumber) return res.status(400).json({ success: false, message: 'idNumber is required' });
 
+  // Helper functions locally scoped to avoid duplicate definitions
+  const calculateAgeLocal = (dob) => {
+    if (!dob) return null;
+    const birthDate = new Date(dob);
+    if (isNaN(birthDate.getTime())) return null;
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+    return age;
+  };
+
+  const parseEmploymentMonthsLocal = (val) => {
+    if (val === undefined || val === null) return 0;
+    if (typeof val === 'number') return val;
+    const match = String(val).match(/\d+/);
+    return match ? parseInt(match[0], 10) : 0;
+  };
+
   try {
+    let app = null;
     // ── Guard: KYC and bureau must be completed ────────────────────────────
     if (applicationId) {
-      const app = await LoanApplication.findById(applicationId)
-        .select('kycVerification bureauVerification phoneVerification');
+      app = await LoanApplication.findById(applicationId);
 
       if (app) {
         const kycStatus    = app.kycVerification?.verificationStatus;
@@ -1333,9 +1467,166 @@ exports.runCreditAssessmentController = async (req, res) => {
       reference: applicationId || `CREDIT-${Date.now()}`,
     });
 
+    // ── Rule Engine & Eligibility Engine & Workflow Routing ─────────────────
+    const settings = await SystemSettings.findOne() || {};
+    const borrower = app ? await Borrower.findOne({ $or: [{ _id: app.borrowerId }, { userId: app.borrowerId }] }) : null;
+
+    // Fetch and assess parameters
+    const totalIncome = Number(affordabilityBody?.income?.totalIncome || borrower?.monthlyNetSalary || 0);
+    const taxes = Number(affordabilityBody?.expenses?.taxes || 0);
+    const rentMortgage = Number(affordabilityBody?.expenses?.rentMortgage || 0);
+    const debtRepayments = Number(affordabilityBody?.expenses?.debtRepayments || 0);
+    const livingExpenses = Number(affordabilityBody?.expenses?.livingExpenses || 0);
+    const totalExpenses = taxes + rentMortgage + debtRepayments + livingExpenses;
+
+    const disposableIncome = totalIncome - totalExpenses;
+    const dti = totalIncome > 0 ? ((debtRepayments + rentMortgage) / totalIncome) * 100 : 0;
+
+    const minSalary = Number(settings.minSalaryRequirement ?? 5000);
+    const maxDti = Number(settings.maxDtiPercentage ?? 40);
+    const warningDtiThreshold = Number(settings.affordabilityWarningThreshold ?? 35);
+    const minDisposable = Number(settings.minDisposableIncome ?? 2000);
+
+    let ncrBenchmark = 0;
+    if (totalIncome > 0) {
+      if (totalIncome <= 800) {
+        ncrBenchmark = totalIncome;
+      } else if (totalIncome <= 6250) {
+        ncrBenchmark = 800 + (totalIncome - 800) * 0.067;
+      } else {
+        ncrBenchmark = 1165 + (totalIncome - 6250) * 0.09;
+      }
+    }
+
+    const rulesRun = {
+      minSalary: totalIncome >= minSalary,
+      dtiThreshold: dti <= maxDti,
+      dtiWarning: dti >= warningDtiThreshold,
+      disposableIncome: disposableIncome >= minDisposable,
+      ncrLivingExpenses: livingExpenses >= ncrBenchmark,
+      dhaVerified: app?.kycVerification?.verificationStatus === 'Verified' || app?.kycVerification?.verificationStatus === 'Overridden',
+      ocrVerified: app?.documentVerificationStatus === 'Complete' || !settings.ocrRequired,
+      amlCleared: app?.amlVerification?.verificationStatus === 'CLEARED' || !settings.amlRequired
+    };
+
+    const dob = borrower?.dateOfBirth || app?.dateOfBirth;
+    const borrowerAge = calculateAgeLocal(dob);
+    const minAge = Number(settings.minimumAge ?? 18);
+    const maxAge = Number(settings.maximumAge ?? 65);
+    const empMonths = parseEmploymentMonthsLocal(borrower?.yearsOfService ? borrower.yearsOfService * 12 : 6);
+    const minEmpDuration = Number(settings.minEmploymentDuration ?? 6);
+
+    const eligibilityRun = {
+      ageRange: borrowerAge ? (borrowerAge >= minAge && borrowerAge <= maxAge) : true,
+      employmentDuration: empMonths >= minEmpDuration,
+      employmentType: settings.employmentType === 'Both' || !borrower?.employmentStatus ||
+        (settings.employmentType === 'Employed' && ['Permanent', 'Contract'].includes(borrower.employmentStatus)) ||
+        (settings.employmentType === 'Self Employed' && ['Self-Employed'].includes(borrower.employmentStatus)),
+      employmentCategory: !borrower?.employmentStatus || (settings.employmentCategories || []).includes(borrower.employmentStatus),
+      allowedProduct: !app?.loanType || (settings.allowedLoanProducts || []).includes(app.loanType)
+    };
+
+    let riskSeverity = 'Low';
+    let warnings = [];
+
+    if (!rulesRun.minSalary) {
+      riskSeverity = 'High';
+      warnings.push('Gross Income below minimum requirement');
+    }
+    if (!rulesRun.dtiThreshold) {
+      riskSeverity = 'High';
+      warnings.push('DTI ratio exceeds maximum allowed threshold');
+    } else if (rulesRun.dtiWarning) {
+      if (riskSeverity !== 'High') riskSeverity = 'Medium';
+      warnings.push('DTI ratio is near the warning threshold');
+    }
+    if (!rulesRun.disposableIncome) {
+      riskSeverity = 'High';
+      warnings.push('Disposable Income below minimum required');
+    }
+    if (!rulesRun.ncrLivingExpenses) {
+      if (riskSeverity !== 'High') riskSeverity = 'Medium';
+      warnings.push('Living expenses fall below NCR survival buffer');
+    }
+
+    const matchedCount = result.matchedConsumers?.length || 0;
+    if (matchedCount > 1) {
+      riskSeverity = 'High';
+      warnings.push('MULTIPLE CONSUMERS FOUND — MANUAL REVIEW RECOMMENDED');
+    } else if (matchedCount === 0 || result.responseCode === 4) {
+      if (riskSeverity !== 'High') riskSeverity = 'Medium';
+      warnings.push('NO CREDIT CONSUMER FOUND');
+    }
+
+    let underwritingDecision = 'Auto Approve';
+    if (riskSeverity === 'High' || riskSeverity === 'Critical') {
+      underwritingDecision = 'Decline';
+    } else if (riskSeverity === 'Medium' || matchedCount > 1 || matchedCount === 0) {
+      underwritingDecision = 'Manual Review Required';
+    }
+
+    if (settings.enableAutoApprovalLogic === false && underwritingDecision === 'Auto Approve') {
+      underwritingDecision = 'Manual Review Required';
+    }
+
+    let workflowRoute = 'Auto Approval Engine';
+    if (underwritingDecision === 'Manual Review Required') {
+      workflowRoute = 'Manual Review Queue';
+    } else if (underwritingDecision === 'Decline') {
+      workflowRoute = 'Rejection Desk';
+    }
+
+    if (matchedCount > 1 || riskSeverity === 'High') {
+      workflowRoute = 'Risk Escalation Queue';
+    }
+
+    const isEligible = Object.values(eligibilityRun).every(val => val === true);
+    const eligibilityStatus = isEligible ? 'Eligible' : 'Ineligible';
+
+    const underwritingResult = {
+      rulesRun,
+      riskSeverity,
+      underwritingDecision,
+      warnings
+    };
+
+    const eligibilityResult = {
+      eligibilityRun,
+      eligibilityStatus
+    };
+
+    const workflowResult = {
+      workflowRoute,
+      reviewerAssignment: settings.enableAutoAssignment ? 'Auto-Assigned' : 'Manual',
+      escalationTriggered: matchedCount > 1 || riskSeverity === 'High'
+    };
+
+    // Print mandated console logs
+    console.log("UNDERWRITING RULE ENGINE EXECUTED:", JSON.stringify(underwritingResult, null, 2));
+    console.log("ELIGIBILITY ENGINE RESULT:", JSON.stringify(eligibilityResult, null, 2));
+    console.log("WORKFLOW ROUTING RESULT:", JSON.stringify(workflowResult, null, 2));
+
     // ── Persist to LoanApplication ─────────────────────────────────────────
+    let currentHash = '';
     if (applicationId) {
-      await LoanApplication.findByIdAndUpdate(applicationId, {
+      // Safe Auto-Heal Check
+      const existingApp = await LoanApplication.findById(applicationId);
+      if (existingApp && (existingApp.affordabilityOutcome === null || typeof existingApp.affordabilityOutcome !== 'object')) {
+        console.log('[AUTO-HEAL] affordabilityOutcome initialized from null object.');
+        await LoanApplication.findByIdAndUpdate(applicationId, {
+          $set: {
+            affordabilityOutcome: {
+              debtToIncomeRatio: null,
+              affordabilityStatus: null,
+              disposableIncome: null,
+              monthlyObligations: null,
+              calculatedAt: null
+            }
+          }
+        });
+      }
+
+      const updatedApp = await LoanApplication.findByIdAndUpdate(applicationId, {
         'creditAssessment.verificationStatus': result.verificationStatus,
         'creditAssessment.enquiryId':          result.enquiryId,
         'creditAssessment.enquiryResultId':    result.enquiryResultId,
@@ -1345,10 +1636,29 @@ exports.runCreditAssessmentController = async (req, res) => {
         'creditAssessment.searchSuccess':      result.searchSuccess,
         'creditAssessment.responseCode':       result.responseCode,
         'creditAssessment.completedAt':        new Date(),
-      });
+        'creditAssessment.underwritingDecision': underwritingDecision,
+        'creditAssessment.riskSeverity':         riskSeverity,
+        'creditAssessment.eligibilityStatus':    eligibilityStatus,
+        'creditAssessment.workflowRoute':        workflowRoute,
+        'affordabilityOutcome.income':           affordabilityBody?.income || {},
+        'affordabilityOutcome.expenses':         affordabilityBody?.expenses || {},
+        'affordabilityOutcome.disposableIncome':  affordabilityBody?.disposableIncome || 0,
+        'affordabilityOutcome.debtToIncomeRatio': affordabilityBody?.debtToIncomeRatio || 0,
+        'affordabilityOutcome.isNcrCompliant':    affordabilityBody?.isNcrCompliant || false
+      }, { new: true });
+
+      if (updatedApp) {
+        currentHash = generateVerificationHash(updatedApp, borrower);
+        updatedApp.creditAssessment.verificationHash = currentHash;
+        if (updatedApp.consumerCreditReport) {
+          updatedApp.consumerCreditReport.verificationHash = currentHash;
+        }
+        await updatedApp.save();
+      }
     }
 
-    // ── Audit log ──────────────────────────────────────────────────────────
+    // ── Audit logs ──────────────────────────────────────────────────────────
+    // Log CREDIT_REPORT_SEARCH legacy log
     await writeAuditLog({
       borrowerId,
       applicationId: applicationId || undefined,
@@ -1364,6 +1674,51 @@ exports.runCreditAssessmentController = async (req, res) => {
         reportReference:     result.reportReference,
       },
     });
+
+    // Log search execution audit trail
+    await writeAuditLog({
+      borrowerId,
+      applicationId: applicationId || undefined,
+      verificationType: 'CREDIT_SEARCH_EXECUTION',
+      status: result.searchSuccess ? 'SUCCESS' : 'FAILED',
+      initiatedBy,
+      riskSeverity,
+      workflowRoute,
+      requestPayload: { idNumber, reference: applicationId, affordability: affordabilityBody },
+      responsePayload: {
+        enquiryId: result.enquiryId,
+        enquiryResultId: result.enquiryResultId,
+        verificationHash: currentHash
+      }
+    });
+
+    // Escalation trigger check
+    if (workflowRoute === 'Risk Escalation Queue' || workflowRoute === 'FRAUD_QUEUE' || matchedCount > 1 || riskSeverity === 'High') {
+      await writeAuditLog({
+        borrowerId,
+        applicationId: applicationId || undefined,
+        verificationType: 'WORKFLOW_ESCALATION',
+        status: 'SUCCESS',
+        initiatedBy,
+        riskSeverity,
+        workflowRoute,
+        requestPayload: { decision: underwritingDecision, reasons: warnings }
+      });
+    }
+
+    // Manual review trigger check
+    if (underwritingDecision === 'Manual Review Required' || underwritingDecision === 'Manual Review' || underwritingDecision === 'MANUAL_REVIEW') {
+      await writeAuditLog({
+        borrowerId,
+        applicationId: applicationId || undefined,
+        verificationType: 'MANUAL_REVIEW_TRIGGER',
+        status: 'SUCCESS',
+        initiatedBy,
+        riskSeverity,
+        workflowRoute,
+        requestPayload: { decision: underwritingDecision, reasons: warnings }
+      });
+    }
 
     // ── Socket events ──────────────────────────────────────────────────────
     try {
@@ -1404,6 +1759,15 @@ exports.runCreditAssessmentController = async (req, res) => {
         reportDate:          result.reportDate,
         searchSuccess:       result.searchSuccess,
         responseCode:        result.responseCode,
+        underwritingDecision,
+        riskSeverity,
+        eligibilityStatus,
+        workflowRoute,
+        consumerSearchExecuted: true,
+        creditReportFetched: false,
+        previousVerificationLoaded: false,
+        verificationLastRunAt: new Date(),
+        verificationHashValid: true
       },
     });
   } catch (error) {
@@ -1840,3 +2204,244 @@ exports.verifyAMLScreeningController = async (req, res) => {
     });
   }
 };
+
+/**
+ * Get active development sandbox bypass configuration.
+ */
+exports.getSandboxBypassConfig = (req, res) => {
+  return res.status(200).json({
+    success: true,
+    data: {
+      sandboxBypass: {
+        sequentialGating: isDevelopmentSandboxBypassEnabled(),
+        nextStepBypass: isDevelopmentNextStepBypassEnabled()
+      }
+    }
+  });
+};
+
+/**
+ * Clear previous credit assessment and report data on application modifications
+ */
+exports.resetCreditAssessmentController = async (req, res) => {
+  const { applicationId } = req.params;
+  
+  if (!applicationId) {
+    return res.status(400).json({ success: false, message: 'applicationId is required' });
+  }
+
+  try {
+    const app = await LoanApplication.findById(applicationId);
+    if (!app) {
+      return res.status(404).json({ success: false, message: 'Application not found' });
+    }
+
+    // Reset credit assessment subdocument
+    app.creditAssessment = {
+      verificationStatus: 'Pending',
+      enquiryId: null,
+      enquiryResultId: null,
+      matchedConsumers: [],
+      reportReference: null,
+      reportDate: null,
+      searchSuccess: false,
+      responseCode: null,
+      underwritingDecision: null,
+      riskSeverity: null,
+      eligibilityStatus: null,
+      workflowRoute: null,
+      completedAt: null,
+      verificationHash: null
+    };
+
+    // Reset root level consumer report indicators
+    app.consumerCreditScore = null;
+    app.consumerRiskCategory = null;
+    app.consumerDebtSummary = {
+      totalOutstandingDebt: null,
+      totalMonthlyInstallment: null,
+      totalArrearsAmount: null,
+      totalAdverseAmount: null,
+      judgementCount: 0,
+      courtNoticeCount: 0,
+      defaultListingCount: 0,
+      highestMonthsInArrears: 0,
+      activeAccountsCount: 0,
+      propertyOwnershipCount: 0
+    };
+    app.fraudIndicators = {
+      safpsListed: false,
+      deceasedStatus: false,
+      debtReviewStatus: false,
+      homeAffairsVerified: false
+    };
+    app.affordabilityOutcome = {};
+    app.underwritingDecision = null;
+    app.workflowRoute = null;
+    app.bureauRecommendation = null;
+    app.bureauReportFetchedAt = null;
+
+    // Reset legacy/nested consumerCreditReport subdocument
+    app.consumerCreditReport = {
+      verificationStatus: 'Pending',
+      completedAt: null,
+      reportReference: null,
+      reportDate: null,
+      enquiryId: null,
+      enquiryResultId: null,
+      scoring: {},
+      debtSummary: {},
+      fraudIndicators: {},
+      underwriting: {
+        level: null,
+        riskCategory: null,
+        reasons: []
+      },
+      consumerDetails: {},
+      accountSummary: [],
+      adverseInformation: {
+        judgments: [],
+        defaults: [],
+        sequestration: [],
+        adminOrders: [],
+        rehabilitation: []
+      },
+      properties: [],
+      directorships: [],
+      addressHistory: [],
+      contactHistory: [],
+      emailHistory: [],
+      employmentHistory: [],
+      enquiryHistory: [],
+      monthlyPaymentHistory: [],
+      pdfReport: null,
+      rawResponse: null,
+      verificationHash: null
+    };
+
+    app.consumerCreditReportRaw = null;
+
+    await app.save();
+
+    console.log(`[CREDIT RESET] Reset credit assessment state for Application: ${applicationId}`);
+
+    // Log CREDIT_RESET audit transaction
+    await writeAuditLog({
+      borrowerId: app.borrowerId,
+      applicationId: app._id,
+      verificationType: 'CREDIT_RESET',
+      status: 'SUCCESS',
+      initiatedBy: req.user?._id || app.borrowerId,
+      requestPayload: { applicationId }
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Credit assessment state reset successfully',
+      data: {
+        consumerSearchExecuted: false,
+        creditReportFetched: false,
+        previousVerificationLoaded: false,
+        verificationLastRunAt: null
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ [Credit Assessment Reset Error]:', error.message);
+    
+    // Log CREDIT_RESET failure
+    try {
+      const failApp = await LoanApplication.findById(applicationId).select('borrowerId').catch(() => null);
+      if (failApp) {
+        await writeAuditLog({
+          borrowerId: failApp.borrowerId,
+          applicationId: failApp._id,
+          verificationType: 'CREDIT_RESET',
+          status: 'ERROR',
+          initiatedBy: req.user?._id || failApp.borrowerId,
+          errorMessage: error.message
+        });
+      }
+    } catch (e) {}
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to reset credit assessment state.'
+    });
+  }
+};
+
+/**
+ * @desc    Securely stream the bank verification PDF
+ * @route   GET /api/verification/bank-report-pdf/:applicationId
+ * @access  Private (Admin, Staff, Underwriter only)
+ */
+exports.getBankReportPdfController = async (req, res) => {
+  const { applicationId } = req.params;
+  const userId = req.user ? req.user._id : null;
+  const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+  try {
+    const app = await LoanApplication.findById(applicationId).select('bankVerification');
+    if (!app || !app.bankVerification || !app.bankVerification.pdfReportPath) {
+      return res.status(404).json({ success: false, message: 'No bank verification PDF found for this application.' });
+    }
+
+    const path = require('path');
+    const fsSync = require('fs');
+
+    // Resolve the path relative to Backend root
+    const filePath = path.join(__dirname, '..', '..', app.bankVerification.pdfReportPath);
+    if (!fsSync.existsSync(filePath)) {
+      return res.status(404).json({ success: false, message: 'Bank verification PDF file not found on disk.' });
+    }
+
+    // Set headers for secure streaming inline
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="bank_verification_report.pdf"');
+
+    // Stream the file chunk by chunk without loading into memory
+    const readStream = fsSync.createReadStream(filePath);
+    readStream.pipe(res);
+  } catch (error) {
+    console.error('[STREAM BANK PDF ERROR]:', error.message);
+    res.status(500).json({ success: false, message: 'Error streaming bank verification report PDF.' });
+  }
+};
+
+/**
+ * @desc    Securely download the bank verification PDF
+ * @route   GET /api/verification/download-bank-report/:applicationId
+ * @access  Private (Admin, Staff, Underwriter only)
+ */
+exports.downloadBankReportController = async (req, res) => {
+  const { applicationId } = req.params;
+
+  try {
+    const app = await LoanApplication.findById(applicationId).select('bankVerification');
+    if (!app || !app.bankVerification || !app.bankVerification.pdfReportPath) {
+      return res.status(404).json({ success: false, message: 'No bank verification PDF found for download.' });
+    }
+
+    const path = require('path');
+    const fsSync = require('fs');
+
+    const filePath = path.join(__dirname, '..', '..', app.bankVerification.pdfReportPath);
+    if (!fsSync.existsSync(filePath)) {
+      return res.status(404).json({ success: false, message: 'Bank verification PDF file not found on disk.' });
+    }
+
+    const fileVersion = app.bankVerification.verificationVersion || 1;
+
+    // Set headers for download as attachment
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="bank-avs-report-v${fileVersion}.pdf"`);
+
+    const readStream = fsSync.createReadStream(filePath);
+    readStream.pipe(res);
+  } catch (error) {
+    console.error('[DOWNLOAD BANK PDF ERROR]:', error.message);
+    res.status(500).json({ success: false, message: 'Error downloading bank verification report PDF.' });
+  }
+};
+

@@ -29,15 +29,15 @@ const parseYesNo = (val) => {
 const normalizeResponse = (raw) => {
   console.log('[BANK-VERIFY] Raw AVS Advanced response:\n', JSON.stringify(raw, null, 2));
 
-  const header  = raw.Header  ?? {};
-  const avs     = raw.Avs     ?? raw.AVS ?? raw.avs ?? {};
-  const success = raw.Success === true || raw.Success === 'true' || raw.Success === 'True';
+  const header  = raw?.Header  ?? {};
+  const avs     = raw?.Avs     ?? raw?.AVS ?? raw?.avs ?? {};
+  const success = raw?.Success === true || raw?.Success === 'true' || raw?.Success === 'True';
 
   return {
     success,
-    reportReference: raw.ReportReference ?? header.ReportReference ?? null,
+    reportReference: raw?.ReportReference ?? header.ReportReference ?? null,
     searchDate:      header.SearchDate   ?? null,
-    responseCode:    raw.ResponseCode    ?? null,
+    responseCode:    raw?.ResponseCode    ?? null,
     avs: {
       status:               avs.Status            ?? avs.status            ?? null,
       statusMessage:        avs.StatusMessage     ?? avs.statusMessage     ?? null,
@@ -55,56 +55,78 @@ const normalizeResponse = (raw) => {
       bankStatusMessage:    avs.bankStatusMessage    ?? avs.BankStatusMessage    ?? null,
       bankResponseTimestamp:avs.bankResponseTimestamp ?? avs.BankResponseTimestamp ?? null,
     },
-    pdfReport:   raw.PDFReport ?? null,
+    pdfReport:   raw?.PDFReport ?? null,
     rawResponse: raw,
   };
 };
 
 // ─── Verification decision engine ─────────────────────────────────────────────
-//
-// Critical checks (any failure → Rejected):
-//   accountFound === "Yes"
-//   accountOpen  === "Yes"
-//   identityMatch === "Yes"
-//
-// Soft checks (failure → VerifiedWithWarnings):
-//   initialsMatch, nameMatch, emailMatch, phoneMatch, accountTypeMatch, acceptsCredits
 
 const runVerificationDecision = (normalized) => {
   const { avs, success } = normalized;
 
-  const criticalPass =
-    avs.accountFound  === 'Yes' &&
-    avs.accountOpen   === 'Yes' &&
-    avs.identityMatch === 'Yes';
+  // Actual Datanamix status strings inside response.Avs:
+  // Verified, VerifiedWithErrors, Failed, NotFound
+  const rawStatus = String(avs.status ?? '').trim();
+  const isRawSuccess = ['Verified', 'VerifiedWithErrors'].includes(rawStatus) || success === true;
 
-  if (criticalPass) {
-    const softFail = [
-      avs.initialsMatch, avs.nameMatch, avs.emailMatch,
-      avs.phoneMatch, avs.accountTypeMatch, avs.acceptsCredits,
-    ].some(v => v === 'No');
+  // Mismatch warnings (initials, phone, email mismatch)
+  const hasMismatchWarning =
+    avs.initialsMatch === 'No' ||
+    avs.phoneMatch === 'No' ||
+    avs.emailMatch === 'No';
 
-    return {
-      verificationStatus: softFail ? 'VerifiedWithWarnings' : 'Verified',
-      statusMessage: avs.statusMessage || (softFail
-        ? 'Account ownership confirmed — minor data mismatches detected'
-        : 'Account ownership confirmed'),
-    };
+  // Fatal failures
+  const isFatalFailure =
+    avs.accountFound === 'No' ||
+    avs.accountOpen === 'No' ||
+    avs.identityMatch === 'No' ||
+    rawStatus === 'Failed' ||
+    rawStatus === 'NotFound';
+
+  let verificationStatus = 'FAILED';
+
+  if (isFatalFailure) {
+    verificationStatus = 'FAILED';
+  } else if (isRawSuccess) {
+    if (hasMismatchWarning || rawStatus === 'VerifiedWithErrors') {
+      verificationStatus = 'VERIFIED_WITH_WARNINGS';
+    } else {
+      verificationStatus = 'VERIFIED';
+    }
+  } else {
+    verificationStatus = 'FAILED';
   }
 
-  // Determine specific rejection reason
-  let statusMessage = avs.statusMessage || 'Bank verification failed.';
-  if (!success && !avs.accountFound) {
-    statusMessage = avs.statusMessage || 'Bank verification was unsuccessful.';
-  } else if (avs.accountFound === 'No') {
-    statusMessage = 'Bank account not found.';
-  } else if (avs.accountOpen === 'No') {
-    statusMessage = 'Bank account is not active/open.';
-  } else if (avs.identityMatch === 'No') {
-    statusMessage = 'Identity number does not match account records.';
+  // Setup readable status messages
+  let statusMessage = avs.statusMessage ?? '';
+  if (verificationStatus === 'VERIFIED') {
+    statusMessage = statusMessage || 'Bank account ownership verified successfully';
+  } else if (verificationStatus === 'VERIFIED_WITH_WARNINGS') {
+    const reasons = [];
+    if (avs.initialsMatch === 'No') reasons.push('Initials mismatch');
+    if (avs.phoneMatch === 'No') reasons.push('Phone mismatch');
+    if (avs.emailMatch === 'No') reasons.push('Email mismatch');
+    if (rawStatus === 'VerifiedWithErrors') reasons.push('Verified with minor errors');
+    statusMessage = reasons.length > 0 
+      ? `VERIFIED WITH WARNINGS: ${reasons.join(', ')}`
+      : 'Bank Account Verified with Exceptions';
+  } else {
+    const reasons = [];
+    if (avs.accountFound === 'No') reasons.push('Account closed or not found');
+    if (avs.accountOpen === 'No') reasons.push('Account closed');
+    if (avs.identityMatch === 'No') reasons.push('Identity mismatch');
+    statusMessage = reasons.length > 0
+      ? `VERIFICATION FAILED: ${reasons.join(', ')}`
+      : statusMessage || 'Bank verification was unsuccessful.';
   }
 
-  return { verificationStatus: 'Rejected', statusMessage };
+  return {
+    verificationStatus,
+    statusMessage,
+    avsStatus: verificationStatus,
+    verificationTimestamp: new Date()
+  };
 };
 
 // ─── Main caller ──────────────────────────────────────────────────────────────
@@ -132,11 +154,22 @@ const callBankVerification = async ({
   idNumber,
   clientReference,
 }) => {
-  if (!accountNumber) throw new Error('accountNumber is required for bank verification');
-  if (!idNumber)      throw new Error('idNumber is required for bank verification');
+  // Input Trim Sanitization - trim all inputs to prevent trailing space verification failures
+  const cleanFullName      = String(fullName ?? '').trim();
+  const cleanBankName      = String(bankName ?? '').trim();
+  const cleanAccountNumber = String(accountNumber ?? '').trim();
+  const cleanBranchCode    = String(branchCode ?? '').trim();
+  const cleanAccountType   = String(accountType ?? '').trim();
+  const cleanPhoneNumber   = String(phoneNumber ?? '').trim();
+  const cleanEmailAddress  = String(emailAddress ?? '').trim();
+  const cleanIdNumber      = String(idNumber ?? '').trim();
+  const cleanReference     = String(clientReference ?? '').trim();
 
-  const reference    = clientReference || `BANK-${Date.now()}`;
-  const resolvedType = accountType || 'Current';
+  if (!cleanAccountNumber) throw new Error('accountNumber is required for bank verification');
+  if (!cleanIdNumber)      throw new Error('idNumber is required for bank verification');
+
+  const reference    = cleanReference || `BANK-${Date.now()}`;
+  const resolvedType = cleanAccountType || 'Current';
   const isSandbox    = process.env.NODE_ENV !== 'production';
 
   // ── Sandbox identity override ──────────────────────────────────────────────
@@ -144,7 +177,7 @@ const callBankVerification = async ({
   // identity combination from the Datanamix AVS documentation instead of
   // attempting to parse the DB borrower name (which would not match sandbox records).
   const SANDBOX_TEST_ID = '0000000000001';
-  const useSandboxOverride = isSandbox && idNumber === SANDBOX_TEST_ID;
+  const useSandboxOverride = isSandbox && cleanIdNumber === SANDBOX_TEST_ID;
 
   let firstName, surname, initials;
 
@@ -154,31 +187,36 @@ const callBankVerification = async ({
     surname   = 'Doe';
     initials  = 'JD';
   } else {
-    const rawParts = (fullName ?? '').trim().split(/\s+/).filter(Boolean);
+    const rawParts = cleanFullName.split(/\s+/).filter(Boolean);
     firstName      = capitalize(rawParts[0] ?? '');
     surname        = rawParts.length > 1 ? capitalize(rawParts[rawParts.length - 1]) : firstName;
     initials       = deriveGivenNameInitials(rawParts);
   }
 
+  // Trim initials, first name, and surname explicitly as well
+  const cleanInitials  = initials.trim();
+  const cleanFirstName = firstName.trim();
+  const cleanSurname   = surname.trim();
+
   const payload = {
     EnvironmentType:       isSandbox ? (process.env.DATANAMIX_ENVIRONMENT || 'SANDBOX') : 'LIVE',
     OutputFormat:          'JSON_AND_PDF',
-    PDFEncryptionPassword: idNumber,
+    PDFEncryptionPassword: cleanIdNumber,
     ClientReference:       reference,
-    Initials:              initials,
-    FirstName:             firstName,
-    Surname:               surname,
+    Initials:              cleanInitials,
+    FirstName:             cleanFirstName,
+    Surname:               cleanSurname,
     IdentityType:          'IDNumber',
-    IdentityNumber:        idNumber,
-    BankAccountNumber:     accountNumber,
-    BankBranchCode:        branchCode || '',
+    IdentityNumber:        cleanIdNumber,
+    BankAccountNumber:     cleanAccountNumber,
+    BankBranchCode:        cleanBranchCode,
     BankAccountType:       resolvedType,
-    MobileNumber:          phoneNumber || '',
-    EmailAddress:          emailAddress || '',
+    MobileNumber:          cleanPhoneNumber,
+    EmailAddress:          cleanEmailAddress,
   };
 
-  console.log('[BANK-VERIFY] FINAL AVS PAYLOAD', JSON.stringify(payload, null, 2));
-  console.log(`[BANK-VERIFY] Calling AVS Advanced — Account: ${accountNumber} | Ref: ${reference}`);
+  console.log('[BANK-VERIFY] FINAL SANITIZED AVS PAYLOAD', JSON.stringify(payload, null, 2));
+  console.log(`[BANK-VERIFY] Calling AVS Advanced — Account: ${cleanAccountNumber} | Ref: ${reference}`);
 
   const response   = await datanamixAxiosClient.post(ENDPOINT, payload);
   const normalized = normalizeResponse(response.data);
@@ -189,8 +227,8 @@ const callBankVerification = async ({
   return {
     ...normalized,
     ...decision,
-    verifiedBankAccount: accountNumber,
-    verifiedBranchCode:  branchCode  || '',
+    verifiedBankAccount: cleanAccountNumber,
+    verifiedBranchCode:  cleanBranchCode,
     verifiedAccountType: resolvedType,
   };
 };

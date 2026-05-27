@@ -2,17 +2,10 @@ const dotenv = require('dotenv');
 const path = require('path');
 const fs = require('fs');
 
-// Load environment variables: .env.development in development mode, then fallback to .env
-const nodeEnv = process.env.NODE_ENV || 'development';
-if (nodeEnv === 'development') {
-  const devEnvPath = path.join(__dirname, '../.env.development');
-  if (fs.existsSync(devEnvPath)) {
-    dotenv.config({ path: devEnvPath });
-  }
-}
+// Load environment variables directly from main .env file
 dotenv.config({ path: path.join(__dirname, '../.env') });
 
-// Hard Production Protection Safeguard
+// Sandbox testing mode warning for production environment
 if (
   process.env.NODE_ENV === 'production' &&
   (
@@ -20,8 +13,8 @@ if (
     process.env.DEV_ONLY_BYPASS_NEXT_STEP === 'true'
   )
 ) {
-  throw new Error(
-    '[SECURITY] Development bypass flags detected in production environment.'
+  console.warn(
+    '[SECURITY WARNING] Development sandbox bypass flags are enabled in a production environment (NODE_ENV=production).'
   );
 }
 

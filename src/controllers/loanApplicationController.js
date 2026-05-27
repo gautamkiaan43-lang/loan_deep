@@ -9,6 +9,8 @@ const { sendSuccess, sendError } = require('../utils/responseHandler');
 const { createNotification } = require('../utils/notificationHelper');
 const BorrowerAlert = require('../models/BorrowerAlert');
 const LoanActivity = require('../models/LoanActivity');
+const { generateVerificationHash } = require('../utils/verificationHashEngine');
+const VerificationLog = require('../models/VerificationLog');
 
 /**
  * @desc    Get all loan applications with pagination, search, and filters
@@ -237,11 +239,76 @@ const LoanDocument = require('../models/LoanDocument');
  * @access  Private/Admin
  */
 const getApplicationDetails = asyncHandler(async (req, res) => {
-  const application = await LoanApplication.findById(req.params.id).lean();
+  // Load as a live Mongoose document (not .lean()) so we can mutate + save if hash mismatch
+  const appDoc = await LoanApplication.findById(req.params.id);
 
-  if (!application) {
+  if (!appDoc) {
     return sendError(res, 'Loan application not found', 404);
   }
+
+  // ── Verification Hash Guard ─────────────────────────────────────────────
+  let verificationHashValid = true;
+  if (appDoc.creditAssessment?.verificationHash) {
+    const borrowerIdVal = appDoc.borrowerId;
+    const borrowerDoc = await Borrower.findOne({
+      $or: [{ _id: borrowerIdVal }, { userId: borrowerIdVal }]
+    });
+    const calculatedHash = generateVerificationHash(appDoc, borrowerDoc);
+    if (calculatedHash !== appDoc.creditAssessment.verificationHash) {
+      verificationHashValid = false;
+
+      // Invalidate all bureau / underwriting fields
+      appDoc.creditAssessment = {
+        verificationStatus: 'Pending', enquiryId: null, enquiryResultId: null,
+        matchedConsumers: [], reportReference: null, reportDate: null,
+        searchSuccess: false, responseCode: null, underwritingDecision: null,
+        riskSeverity: null, eligibilityStatus: null, workflowRoute: null,
+        completedAt: null, verificationHash: null
+      };
+      appDoc.consumerCreditScore    = null;
+      appDoc.consumerRiskCategory   = null;
+      appDoc.consumerDebtSummary    = { totalOutstandingDebt: null, totalMonthlyInstallment: null,
+        totalArrearsAmount: null, totalAdverseAmount: null, judgementCount: 0,
+        courtNoticeCount: 0, defaultListingCount: 0, highestMonthsInArrears: 0,
+        activeAccountsCount: 0, propertyOwnershipCount: 0 };
+      appDoc.fraudIndicators        = { safpsListed: false, deceasedStatus: false,
+        debtReviewStatus: false, homeAffairsVerified: false };
+      appDoc.affordabilityOutcome   = {};
+      appDoc.underwritingDecision   = null;
+      appDoc.workflowRoute          = null;
+      appDoc.bureauRecommendation   = null;
+      appDoc.bureauReportFetchedAt  = null;
+      appDoc.consumerCreditReport   = {
+        verificationStatus: 'Pending', completedAt: null, reportReference: null,
+        reportDate: null, enquiryId: null, enquiryResultId: null,
+        scoring: {}, debtSummary: {}, fraudIndicators: {},
+        underwriting: { level: null, riskCategory: null, reasons: [] },
+        consumerDetails: {}, accountSummary: [],
+        adverseInformation: { judgments: [], defaults: [], sequestration: [], adminOrders: [], rehabilitation: [] },
+        properties: [], directorships: [], addressHistory: [], contactHistory: [],
+        emailHistory: [], employmentHistory: [], enquiryHistory: [],
+        monthlyPaymentHistory: [], pdfReport: null, rawResponse: null, verificationHash: null
+      };
+      appDoc.consumerCreditReportRaw = null;
+      await appDoc.save();
+
+      try {
+        await VerificationLog.create({
+          borrowerId: borrowerDoc?._id || borrowerIdVal,
+          applicationId: appDoc._id,
+          verificationType: 'HASH_INVALIDATION',
+          status: 'SUCCESS',
+          initiatedBy: req.user?._id || borrowerIdVal,
+          requestPayload: { reason: 'Financial details or applicant data mismatch with bureau hash' }
+        });
+      } catch (logErr) {
+        console.error('⚠️ [Audit Log Error]: Failed to write HASH_INVALIDATION log:', logErr.message);
+      }
+    }
+  }
+
+  // Use plain object from here for response construction
+  const application = appDoc.toObject();
 
   // Fetch related data
   const employment = await LoanEmployment.findOne({ loanApplicationId: application._id }).lean();
@@ -257,10 +324,7 @@ const getApplicationDetails = asyncHandler(async (req, res) => {
                   doc.documentType === 'Bank Statement' ? 'bankStatement' :
                   doc.documentType === 'Proof Of Address' ? 'addressProof' : null;
       if (key) {
-        formattedDocs[key] = {
-          url: doc.fileUrl,
-          fileName: doc.fileName
-        };
+        formattedDocs[key] = { url: doc.fileUrl, fileName: doc.fileName };
       }
     });
   }
@@ -293,6 +357,11 @@ const getApplicationDetails = asyncHandler(async (req, res) => {
     reviewStatus: application.reviewStatus === 'Pending' && application.staffReview?.recommendation && application.staffReview.recommendation !== 'Pending'
       ? (application.staffReview.recommendation.includes('Reject') ? 'Rejected Recommendation' : 'Recommendation Submitted')
       : application.reviewStatus,
+    consumerSearchExecuted: !!(application.creditAssessment?.enquiryResultId),
+    creditReportFetched: !!(application.consumerCreditReport?.verificationStatus === 'Verified'),
+    previousVerificationLoaded: !!(application.creditAssessment?.enquiryResultId || application.consumerCreditReport?.verificationStatus === 'Verified'),
+    verificationLastRunAt: application.consumerCreditReport?.completedAt || application.creditAssessment?.completedAt || null,
+    verificationHashValid
   };
 
   sendSuccess(res, 'Loan application details fetched successfully', fullApplication);
@@ -315,6 +384,18 @@ const approveApplication = asyncHandler(async (req, res) => {
 
   if (!application) {
     return sendError(res, 'Loan application not found', 404);
+  }
+
+  // Compliance Guard: requirePdfBeforeApproval check
+  const SystemSettings = require('../models/SystemSettings');
+  const BureauReportArchive = require('../models/bureauReportArchive.model');
+  const settings = (await SystemSettings.findOne()) || {};
+  
+  if (settings.requirePdfBeforeApproval) {
+    const archiveExists = await BureauReportArchive.findOne({ applicationId: application._id });
+    if (!archiveExists) {
+      return sendError(res, 'Compliance Block: A verified credit bureau PDF report must be generated and archived in ImageKit compliance vault before this application can be approved.', 400);
+    }
   }
 
   if (application.status === 'Approved') {

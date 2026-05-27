@@ -8,6 +8,8 @@ const asyncHandler = require('../../utils/asyncHandler');
 const { sendSuccess, sendError } = require('../../utils/responseHandler');
 const { getIO } = require('../../socket/socketServer');
 const { createNotification } = require('../../utils/notificationHelper');
+const { generateVerificationHash } = require('../../utils/verificationHashEngine');
+const VerificationLog = require('../../models/VerificationLog');
 
 /**
  * @desc    Get Staff Loan Request Stats Summary
@@ -133,6 +135,122 @@ const getLoanRequestById = asyncHandler(async (req, res) => {
     return sendError(res, 'Loan application not found', 404);
   }
 
+  let verificationHashValid = true;
+  if (app.creditAssessment?.verificationHash) {
+    const borrowerIdVal = app.borrowerId?._id || app.borrowerId;
+    const borrower = await Borrower.findOne({
+      $or: [
+        { _id: borrowerIdVal },
+        { userId: borrowerIdVal }
+      ]
+    });
+    const calculatedHash = generateVerificationHash(app, borrower);
+    if (calculatedHash !== app.creditAssessment.verificationHash) {
+      verificationHashValid = false;
+
+      // Invalidate existing credit/bureau assessment in DB
+      app.creditAssessment = {
+        verificationStatus: 'Pending',
+        enquiryId: null,
+        enquiryResultId: null,
+        matchedConsumers: [],
+        reportReference: null,
+        reportDate: null,
+        searchSuccess: false,
+        responseCode: null,
+        underwritingDecision: null,
+        riskSeverity: null,
+        eligibilityStatus: null,
+        workflowRoute: null,
+        completedAt: null,
+        verificationHash: null
+      };
+
+      app.consumerCreditScore = null;
+      app.consumerRiskCategory = null;
+      app.consumerDebtSummary = {
+        totalOutstandingDebt: null,
+        totalMonthlyInstallment: null,
+        totalArrearsAmount: null,
+        totalAdverseAmount: null,
+        judgementCount: 0,
+        courtNoticeCount: 0,
+        defaultListingCount: 0,
+        highestMonthsInArrears: 0,
+        activeAccountsCount: 0,
+        propertyOwnershipCount: 0
+      };
+      app.fraudIndicators = {
+        safpsListed: false,
+        deceasedStatus: false,
+        debtReviewStatus: false,
+        homeAffairsVerified: false
+      };
+      app.affordabilityOutcome = {};
+      app.underwritingDecision = null;
+      app.workflowRoute = null;
+      app.bureauRecommendation = null;
+      app.bureauReportFetchedAt = null;
+
+      app.consumerCreditReport = {
+        verificationStatus: 'Pending',
+        completedAt: null,
+        reportReference: null,
+        reportDate: null,
+        enquiryId: null,
+        enquiryResultId: null,
+        scoring: {},
+        debtSummary: {},
+        fraudIndicators: {},
+        underwriting: {
+          level: null,
+          riskCategory: null,
+          reasons: []
+        },
+        consumerDetails: {},
+        accountSummary: [],
+        adverseInformation: {
+          judgments: [],
+          defaults: [],
+          sequestration: [],
+          adminOrders: [],
+          rehabilitation: []
+        },
+        properties: [],
+        directorships: [],
+        addressHistory: [],
+        contactHistory: [],
+        emailHistory: [],
+        employmentHistory: [],
+        enquiryHistory: [],
+        monthlyPaymentHistory: [],
+        pdfReport: null,
+        rawResponse: null,
+        verificationHash: null
+      };
+
+      app.consumerCreditReportRaw = null;
+
+      await app.save();
+
+      // Write 'HASH_INVALIDATION' log
+      try {
+        await VerificationLog.create({
+          borrowerId: borrower?._id || borrowerIdVal,
+          applicationId: app._id,
+          verificationType: 'HASH_INVALIDATION',
+          status: 'SUCCESS',
+          initiatedBy: req.user?._id || borrowerIdVal,
+          requestPayload: {
+            reason: 'Financial details or applicant data mismatch with bureau hash'
+          }
+        });
+      } catch (logErr) {
+        console.error('⚠️ [Audit Log Error]: Failed to write HASH_INVALIDATION log:', logErr.message);
+      }
+    }
+  }
+
   const [employment, banking, docs] = await Promise.all([
     LoanEmployment.findOne({ loanApplicationId: app._id }),
     LoanBanking.findOne({ loanApplicationId: app._id }),
@@ -199,7 +317,22 @@ const getLoanRequestById = asyncHandler(async (req, res) => {
     staffNotes: {
       reviewNotes: app.staffReview?.verificationNotes || '',
       verificationNotes: app.staffReview?.verificationNotes || ''
-    }
+    },
+    creditAssessment: app.creditAssessment,
+    consumerCreditScore: app.consumerCreditScore,
+    consumerRiskCategory: app.consumerRiskCategory,
+    consumerDebtSummary: app.consumerDebtSummary,
+    fraudIndicators: app.fraudIndicators,
+    affordabilityOutcome: app.affordabilityOutcome,
+    underwritingDecision: app.underwritingDecision,
+    workflowRoute: app.workflowRoute,
+    consumerCreditReportRaw: app.consumerCreditReportRaw,
+    consumerCreditReport: app.consumerCreditReport,
+    consumerSearchExecuted: !!(app.creditAssessment?.enquiryResultId),
+    creditReportFetched: !!(app.consumerCreditReport?.verificationStatus === 'Verified'),
+    previousVerificationLoaded: !!(app.creditAssessment?.enquiryResultId || app.consumerCreditReport?.verificationStatus === 'Verified'),
+    verificationLastRunAt: app.consumerCreditReport?.completedAt || app.creditAssessment?.completedAt || null,
+    verificationHashValid: verificationHashValid
   };
 
   sendSuccess(res, 'Application details hydrated', result);

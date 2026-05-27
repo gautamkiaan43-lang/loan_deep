@@ -235,7 +235,7 @@ const callAMLVerification = async ({ idNumber, fullName, clientReference }) => {
     Country: 'ZA',
     MinScore: 90,
     Identifier: idNumber.trim(),
-    IdentifierMatchBoostingThreshold: 88,
+    IdentifierMatchBoostingThreshold: 90,
     DataSource: '',
     Page: 1
   };

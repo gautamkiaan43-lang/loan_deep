@@ -5,7 +5,7 @@ const ENDPOINT = '/v1/credit/datanamix/consumer-search';
 // ─── Response normalizer ──────────────────────────────────────────────────────
 
 const normalizeResponse = (raw) => {
-  console.log('[CREDIT-SEARCH] Raw Datanamix Consumer Credit Search response:\n', JSON.stringify(raw, null, 2));
+  console.log("RAW CREDIT SEARCH RESPONSE:", JSON.stringify(raw, null, 2));
 
   const header   = raw.Header          ?? {};
   const consumers = raw.ConsumerDetails ?? [];
@@ -84,7 +84,7 @@ const callConsumerCreditSearch = async ({
     PassportNumber:  passportNumber,
   };
 
-  console.log(`[CREDIT-SEARCH] Calling Datanamix Consumer Credit Search — Ref: ${clientRef}`);
+  console.log("CREDIT SEARCH OUTGOING PAYLOAD:", JSON.stringify(payload, null, 2));
 
   const response = await datanamixAxiosClient.post(ENDPOINT, payload);
   const normalized = normalizeResponse(response.data);

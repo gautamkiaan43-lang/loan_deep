@@ -21,9 +21,25 @@ const {
   verifyBankVerificationController,
   runCreditAssessmentController,
   overrideCreditAssessmentController,
-  fetchConsumerCreditReportController,
-  verifyAMLScreeningController,
+  getSandboxBypassConfig,
+  resetCreditAssessmentController,
+  getBankReportPdfController,
+  downloadBankReportController,
 } = require('../controllers/verification.controller');
+
+const {
+  fetchConsumerCreditReportController,
+  getCreditReportPdfController,
+  downloadCreditReportController,
+  getCreditReportHistoryController,
+  logPrintEventController
+} = require('../controllers/verification/consumerCreditReportController');
+
+const {
+  verifyAMLScreeningController,
+  getAmlReportPdfController,
+  downloadAmlReportController
+} = require('../controllers/verification/amlScreening.controller');
 
 const { protectVerification } = require('../middleware/auth.middleware');
 const { requireConsent, validateProfileData } = require('../middleware/verification.middleware');
@@ -43,6 +59,14 @@ const kycUpload = multer({
 router.use(protectVerification);
 
 /**
+ * @route   GET /api/verification/sandbox-bypass
+ * @desc    Get active development sandbox bypass configuration
+ * @access  Private
+ */
+router.get('/sandbox-bypass', getSandboxBypassConfig);
+
+/**
+
  * @route   POST /api/verification/identity
  * @desc    Validate borrower's DHA ID number & match photo
  * @access  Private
@@ -182,10 +206,86 @@ router.put('/credit-search-override/:applicationId', overrideCreditAssessmentCon
 router.post('/consumer-credit-report/:applicationId', fetchConsumerCreditReportController);
 
 /**
+ * @route   POST /api/verification/reset-credit-assessment/:applicationId
+ * @desc    Clear previous credit assessment/report data on application modifications
+ * @access  Private
+ */
+router.post('/reset-credit-assessment/:applicationId', resetCreditAssessmentController);
+
+/**
  * @route   POST /api/verification/aml-screening/:applicationId
  * @desc    Step 5: Perform AML, watchlists, PEP, and sanctions screening
  * @access  Private
  */
 router.post('/aml-screening/:applicationId', verifyAMLScreeningController);
+
+// Local Role Authorization Helper
+const authorizeRoles = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user || !allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: Direct PDF access restricted to Staff, Admin, or Underwriter roles.'
+      });
+    }
+    next();
+  };
+};
+
+/**
+ * @route   GET /api/verification/credit-report-pdf/:applicationId
+ * @desc    Securely stream the watermarked credit report PDF
+ * @access  Private (Admin/Staff only)
+ */
+router.get('/credit-report-pdf/:applicationId', authorizeRoles('admin', 'staff'), getCreditReportPdfController);
+
+/**
+ * @route   GET /api/verification/download-credit-report/:applicationId
+ * @desc    Securely stream download of the credit report PDF
+ * @access  Private (Admin/Staff only)
+ */
+router.get('/download-credit-report/:applicationId', authorizeRoles('admin', 'staff'), downloadCreditReportController);
+
+/**
+ * @route   GET /api/verification/credit-report-history/:applicationId
+ * @desc    Get credit report document audit and version history
+ * @access  Private (Admin/Staff only)
+ */
+router.get('/credit-report-history/:applicationId', authorizeRoles('admin', 'staff'), getCreditReportHistoryController);
+
+/**
+ * @route   POST /api/verification/log-print-event/:applicationId
+ * @desc    Log a document print compliance audit event
+ * @access  Private (Admin/Staff only)
+ */
+router.post('/log-print-event/:applicationId', authorizeRoles('admin', 'staff'), logPrintEventController);
+
+/**
+ * @route   GET /api/verification/bank-report-pdf/:applicationId
+ * @desc    Securely stream the bank verification PDF
+ * @access  Private (Admin/Staff/Underwriter only)
+ */
+router.get('/bank-report-pdf/:applicationId', authorizeRoles('admin', 'staff', 'underwriter'), getBankReportPdfController);
+
+/**
+ * @route   GET /api/verification/download-bank-report/:applicationId
+ * @desc    Securely download the bank verification PDF
+ * @access  Private (Admin/Staff/Underwriter only)
+ */
+router.get('/download-bank-report/:applicationId', authorizeRoles('admin', 'staff', 'underwriter'), downloadBankReportController);
+
+/**
+ * @route   GET /api/verification/aml-report-pdf/:applicationId
+ * @desc    Securely stream the AML watchlist report PDF
+ * @access  Private (Admin/Staff only)
+ */
+router.get('/aml-report-pdf/:applicationId', authorizeRoles('admin', 'staff'), getAmlReportPdfController);
+
+/**
+ * @route   GET /api/verification/download-aml-report/:applicationId
+ * @desc    Securely download the AML watchlist report PDF
+ * @access  Private (Admin/Staff only)
+ */
+router.get('/download-aml-report/:applicationId', authorizeRoles('admin', 'staff'), downloadAmlReportController);
 
 module.exports = router;

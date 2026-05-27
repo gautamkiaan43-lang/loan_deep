@@ -249,10 +249,13 @@ const loanApplicationSchema = new mongoose.Schema(
     bankVerification: {
       verificationStatus: {
         type: String,
-        enum: ['Pending', 'Verified', 'VerifiedWithWarnings', 'Rejected', 'Failed'],
+        enum: ['Pending', 'Verified', 'VerifiedWithWarnings', 'Rejected', 'Failed', 'VERIFIED', 'VERIFIED_WITH_WARNINGS', 'FAILED', 'NOT_FOUND'],
         default: 'Pending',
       },
+      status:               { type: String, default: 'Pending' },
+      avsStatus:            { type: String },
       statusMessage:        { type: String },
+      verificationLevel:    { type: String },
       accountFound:         { type: String },
       accountOpen:          { type: String },
       acceptsCredits:       { type: String },
@@ -267,11 +270,22 @@ const loanApplicationSchema = new mongoose.Schema(
       bankStatusMessage:    { type: String },
       reportReference:      { type: String },
       verifiedAt:           { type: Date },
+      verificationTimestamp:{ type: Date },
       verifiedBankAccount:  { type: String },
       verifiedBranchCode:   { type: String },
       verifiedAccountType:  { type: String },
       pdfReport:            { type: String },
+      pdfReportPath:        { type: String },
+      pdfHash:              { type: String },
+      verificationVersion:  { type: Number, default: 1 },
       rawResponse:          { type: mongoose.Schema.Types.Mixed, default: {} },
+      verifiedBy:           { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      fraudIndicators:      [{ type: String }],
+      mismatchFlags:        [{ type: String }],
+      sandboxBypassEnabled: { type: Boolean, default: false },
+      environmentType:      { type: String },
+      bypassReason:         { type: String },
+      bypassActivatedAt:    { type: Date }
     },
 
     // ── Consumer Credit Report Search (Datanamix — Step 2) ──────────────────
@@ -307,7 +321,13 @@ const loanApplicationSchema = new mongoose.Schema(
       overriddenBy:   { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
       overriddenAt:   { type: Date },
 
-      completedAt: { type: Date }
+      completedAt: { type: Date },
+
+      underwritingDecision: { type: String },
+      riskSeverity:         { type: String },
+      eligibilityStatus:    { type: String },
+      workflowRoute:        { type: String },
+      verificationHash:     { type: String }
     },
 
     // ── Consumer Credit Report Result (Datanamix — Step 4) ───────────────────
@@ -374,7 +394,8 @@ const loanApplicationSchema = new mongoose.Schema(
       monthlyPaymentHistory:[{ type: mongoose.Schema.Types.Mixed }],
 
       pdfReport:   { type: String },
-      rawResponse: { type: mongoose.Schema.Types.Mixed, default: {} }
+      rawResponse: { type: mongoose.Schema.Types.Mixed, default: {} },
+      verificationHash: { type: String }
     },
 
     // ── AML & Sanctions Screening ────────────────────────────────────────────
@@ -416,6 +437,38 @@ const loanApplicationSchema = new mongoose.Schema(
       screeningTimestamp: Date
     },
 
+    // ── Enterprise AML & Sanctions Compliance ──────────────────────────────
+    compliance: {
+      aml: {
+        verificationStatus: { type: String, default: 'NOT_STARTED' },
+        complianceDecision: { type: String },
+        riskLevel: { type: String },
+        amlScore: { type: Number },
+        sanctionsStatus: { type: String },
+        reportReference: { type: String },
+        isBlocked: { type: Boolean, default: false },
+        ofacMatch: { type: Boolean, default: false },
+        sanctionsMatch: { type: Boolean, default: false },
+        terrorMatch: { type: Boolean, default: false },
+        pepMatch: { type: Boolean, default: false },
+        fatfMatch: { type: Boolean, default: false },
+        adverseMediaMatch: { type: Boolean, default: false },
+        riskReason: { type: String },
+        matchedEntities: { type: Array, default: [] },
+        rawResponse: { type: mongoose.Schema.Types.Mixed, default: {} },
+        verifiedAt: { type: Date },
+        provider: { type: String, default: 'DATANAMIX' },
+        pdfPath: { type: String },
+        pdfHash: { type: String },
+        version: { type: Number, default: 1 }
+      }
+    },
+
+    // Root-level gating metrics updated by compliance runs
+    complianceGate: { type: String },
+    approvalEligibility: { type: String },
+    disbursementEligibility: { type: String },
+
     // Digital Agreement Signature Fields
     agreementGenerated: { type: Boolean, default: false },
     agreementGeneratedAt: { type: Date },
@@ -426,7 +479,19 @@ const loanApplicationSchema = new mongoose.Schema(
     borrowerConsentVerified: { type: Boolean, default: false },
     agreementHtml: { type: String, default: '' },
     agreementPdfUrl: { type: String, default: '' },
-    signedAgreement: { type: String, default: '' }
+    signedAgreement: { type: String, default: '' },
+
+    // ── Consumer Credit Report Result (Datanamix — Dynamic Underwriting) ──
+    consumerCreditReportRaw: { type: mongoose.Schema.Types.Mixed, default: {} },
+    consumerCreditScore:     { type: Number },
+    consumerRiskCategory:    { type: String },
+    consumerDebtSummary:     { type: mongoose.Schema.Types.Mixed, default: {} },
+    fraudIndicators:         { type: mongoose.Schema.Types.Mixed, default: {} },
+    affordabilityOutcome:    { type: Object, default: {} },
+    underwritingDecision:    { type: String },
+    workflowRoute:           { type: String },
+    bureauRecommendation:    { type: String },
+    bureauReportFetchedAt:   { type: Date }
   },
   {
     timestamps: true,
