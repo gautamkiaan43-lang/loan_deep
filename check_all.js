@@ -23,4 +23,9 @@ async function checkAllAssignments() {
   }
 }
 
+
+
+
+
+
 checkAllAssignments();
