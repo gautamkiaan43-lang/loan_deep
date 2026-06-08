@@ -31,6 +31,9 @@ const getAllApplications = asyncHandler(async (req, res) => {
     endDate
   } = req.query;
 
+  console.log('--- GET ALL APPLICATIONS ---');
+  console.log('req.query:', req.query);
+
   const query = {};
 
   // Search by borrower name, application ID, email, phone
@@ -91,6 +94,8 @@ const getAllApplications = asyncHandler(async (req, res) => {
     if (startDate) query.createdAt.$gte = new Date(startDate);
     if (endDate) query.createdAt.$lte = new Date(endDate);
   }
+
+  console.log('Mongoose Query built:', JSON.stringify(query, null, 2));
 
   const skip = (page - 1) * limit;
 

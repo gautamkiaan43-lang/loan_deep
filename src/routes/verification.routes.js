@@ -9,6 +9,7 @@ const router = express.Router();
 const {
   verifyIdentityController,
   verifyFaceLivenessController,
+  getFaceSessionTokenController,
   verifyBankController,
   verifyCreditController,
   verifyPhoneController,
@@ -87,6 +88,13 @@ router.post(
   validateProfileData(['borrowerId', 'faceScan', 'sessionId']),
   verifyFaceLivenessController
 );
+
+/**
+ * @route   GET /api/verification/face-session-token
+ * @desc    Get a new FaceTec SDK session token
+ * @access  Private
+ */
+router.get('/face-session-token', getFaceSessionTokenController);
 
 /**
  * @route   POST /api/verification/bank

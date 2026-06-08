@@ -22,6 +22,7 @@ const loanApplicationRoutes = require('./routes/loanApplicationRoutes');
 const activeLoanRoutes = require('./routes/admin/activeLoanRoutes');
 const paymentRoutes = require('./routes/admin/paymentRoutes');
 const duePaymentRoutes = require('./routes/admin/duePaymentRoutes');
+const nupayRoutes = require('./routes/admin/nupayRoutes');
 const reportRoutes = require('./routes/admin/reportRoutes');
 const communicationRoutes = require('./routes/admin/communicationRoutes');
 const settingsRoutes = require('./routes/admin/settingsRoutes');
@@ -46,30 +47,20 @@ const borrowerApplyLoanRoutes = require('./routes/borrowerLoanRoutes');
 const verificationRoutes = require('./routes/verification.routes');
 const agreementRoutes = require('./modules/agreementSigning/routes/agreementSigning.routes');
 const validationRoutes = require('./routes/validationRoutes');
-
-
-
 const app = express();
-
 // Body parser — 10 MB limit supports base64 image payloads from KYC flows
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
 // Cookie parser
 app.use(cookieParser());
-
-
 // Dev logging middleware
 if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }
-
 // Set security headers
 app.use(helmet());
-
 // Enable CORS
 app.use(cors());
-
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 10 * 60 * 1000, // 10 mins
@@ -77,7 +68,6 @@ const limiter = rateLimit({
   message: 'Too many requests from this IP, please try again after 10 minutes'
 });
 app.use(limiter);
-
 // Mount routers
 app.use('/api/auth', authRoutes);
 app.use('/api/admin/borrowers', adminBorrowerRoutes);
@@ -88,6 +78,8 @@ app.use('/api/admin/loan-applications', loanApplicationRoutes);
 app.use('/api/admin/active-loans', activeLoanRoutes);
 app.use('/api/admin/payments', paymentRoutes);
 app.use('/api/admin/due-payments', duePaymentRoutes);
+app.use('/api/admin/nupay', nupayRoutes);
+
 app.use('/api/admin/reports', reportRoutes);
 app.use('/api/admin/communications', communicationRoutes);
 app.use('/api/admin/settings', settingsRoutes);

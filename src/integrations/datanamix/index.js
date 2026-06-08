@@ -5,7 +5,7 @@
 
 const { getAccessToken, clearTokenCache } = require('./auth/token.service');
 const { verifyIdentity } = require('./identity/idVerification.service');
-const { verifyFaceLiveness } = require('./identity/faceVerification.service');
+const { verifyFaceLiveness, getFaceSessionToken } = require('./identity/faceVerification.service');
 const { verifyBankAccount } = require('./bank/bankVerification.service');
 const { getConsumerCreditReport } = require('./credit/creditReport.service');
 const { verifyPhoneOwnership } = require('./phone/phoneVerification.service');
@@ -23,7 +23,8 @@ module.exports = {
   // Borrower Identity Verify
   identity: {
     verifyIdentity,       // DHA IDV + Photo matching
-    verifyFaceLiveness    // FaceTec 3D liveness scan
+    verifyFaceLiveness,   // FaceTec 3D liveness scan
+    getFaceSessionToken
   },
   
   // Bank Account Ownership Verify

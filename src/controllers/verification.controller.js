@@ -172,6 +172,26 @@ exports.verifyFaceLivenessController = async (req, res) => {
 };
 
 /**
+ * 2.5. FaceTec Session Token Controller
+ */
+exports.getFaceSessionTokenController = async (req, res) => {
+  try {
+    console.log(`🎭 [FaceTec Session Token Requested]`);
+    const result = await datanamix.identity.getFaceSessionToken();
+    return res.status(200).json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    console.error('❌ [FaceTec Session Token Controller Error]:', error.message);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Error occurred while retrieving FaceTec session token.'
+    });
+  }
+};
+
+/**
  * 3. Bank Account Ownership Verification Controller (Account Holder Verification Advanced)
  */
 exports.verifyBankController = async (req, res) => {

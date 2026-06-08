@@ -480,6 +480,8 @@ const loanApplicationSchema = new mongoose.Schema(
     agreementHtml: { type: String, default: '' },
     agreementPdfUrl: { type: String, default: '' },
     signedAgreement: { type: String, default: '' },
+    debicheckMandateStatus: { type: String, default: '' },
+    debicheckMandateReference: { type: String, default: '' },
 
     // ── Consumer Credit Report Result (Datanamix — Dynamic Underwriting) ──
     consumerCreditReportRaw: { type: mongoose.Schema.Types.Mixed, default: {} },
