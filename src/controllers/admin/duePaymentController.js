@@ -133,7 +133,7 @@ const getAllDuePayments = asyncHandler(async (req, res) => {
   await syncDuePayments();
 
   const { page = 1, limit = 10, search = '', status } = req.query;
-  const query = { isDeleted: false, dueStatus: { $ne: 'Paid' } };
+  const query = { isDeleted: false, dueStatus: { $nin: ['Paid', 'Rescheduled', 'Cancelled', 'Recalled'] } };
 
   if (search) {
     query.$or = [
@@ -192,7 +192,7 @@ const getDuePaymentStats = asyncHandler(async (req, res) => {
   const lateEmiAccounts = await DuePayment.distinct('loanId', { dueStatus: 'Overdue', isDeleted: false });
 
   const aggregate = await DuePayment.aggregate([
-    { $match: { isDeleted: false, dueStatus: { $ne: 'Paid' } } },
+    { $match: { isDeleted: false, dueStatus: { $nin: ['Paid', 'Rescheduled', 'Cancelled', 'Recalled'] } } },
     { $group: { _id: null, totalDue: { $sum: '$totalDueAmount' } } }
   ]);
   const totalDueAmount = aggregate.length > 0 ? aggregate[0].totalDue : 0;
@@ -282,7 +282,7 @@ const sendBulkReminders = asyncHandler(async (req, res) => {
  */
 const exportDuePayments = asyncHandler(async (req, res) => {
   await syncDuePayments();
-  const duePayments = await DuePayment.find({ isDeleted: false, dueStatus: { $ne: 'Paid' } }).lean();
+  const duePayments = await DuePayment.find({ isDeleted: false, dueStatus: { $nin: ['Paid', 'Rescheduled', 'Cancelled', 'Recalled'] } }).lean();
   sendSuccess(res, 'Export data ready', { duePayments });
 });
 

@@ -104,7 +104,7 @@ const validateLoanApplicationData = (data, rules) => {
 
   // 7. Validate Documents (Check if array provided in data payload)
   if (Array.isArray(data.documents)) {
-    const docTypes = data.documents.map(d => typeof d === 'string' ? d : d.documentType);
+    const docTypes = data.documents.map(d => typeof d === 'string' ? d : (d.documentType || d.type));
     const missingDocs = [];
     if (rules.requiredKYC.idDocument && !docTypes.some(t => ['ID Document', 'idDocument'].includes(t))) {
       missingDocs.push("ID Document");

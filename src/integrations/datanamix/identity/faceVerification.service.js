@@ -9,13 +9,14 @@ const datanamixConfig = require('../../../config/datanamix.config');
 const getFaceSessionToken = async () => {
   const baseUrl = datanamixConfig.endpoints.faceVerification || '';
   
-  if (baseUrl.includes('chana-onprem-usage-logs.datanamix.com')) {
+  if (baseUrl.includes('chana-onprem-usage-logs.datanamix.com') || baseUrl.includes('api.facetec.com')) {
     const url = baseUrl.endsWith('/') ? `${baseUrl}session-token` : `${baseUrl}/session-token`;
-    console.log(`[FaceTec] Requesting Session Token directly from on-premise server: ${url}`);
+    console.log(`[FaceTec] Requesting Session Token directly from server: ${url}`);
     
     const response = await axios.get(url, {
       headers: {
         'X-Device-Key-Identifier': process.env.FACETEC_DEVICE_KEY_IDENTIFIER || 'dummy-device-key',
+        'X-Device-Key': process.env.FACETEC_DEVICE_KEY_IDENTIFIER || 'dummy-device-key',
         'X-User-Agent': 'FaceTecSDK-browser-9.7.120',
       },
       timeout: 10000
@@ -45,9 +46,9 @@ const verifyFaceLiveness = async (sessionData = {}) => {
   const baseUrl = datanamixConfig.endpoints.faceVerification || '';
 
   // Direct FaceTec Server implementation
-  if (baseUrl.includes('chana-onprem-usage-logs.datanamix.com')) {
+  if (baseUrl.includes('chana-onprem-usage-logs.datanamix.com') || baseUrl.includes('api.facetec.com')) {
     const url = baseUrl.endsWith('/') ? `${baseUrl}liveness-3d` : `${baseUrl}/liveness-3d`;
-    console.log(`[FaceTec] POST to direct on-premise endpoint: ${url}`);
+    console.log(`[FaceTec] POST to direct endpoint: ${url}`);
     try {
       const response = await axios.post(url, {
         faceScan,
@@ -57,6 +58,7 @@ const verifyFaceLiveness = async (sessionData = {}) => {
         headers: {
           'Content-Type': 'application/json',
           'X-Device-Key-Identifier': process.env.FACETEC_DEVICE_KEY_IDENTIFIER || 'dummy-device-key',
+          'X-Device-Key': process.env.FACETEC_DEVICE_KEY_IDENTIFIER || 'dummy-device-key',
           'X-User-Agent': 'FaceTecSDK-browser-9.7.120',
         },
         timeout: 15000

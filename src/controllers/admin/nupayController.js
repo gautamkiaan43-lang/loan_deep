@@ -2,6 +2,7 @@ const asyncHandler = require('express-async-handler');
 const nupayService = require('../../services/nupayService');
 const LoanApplication = require('../../models/LoanApplication');
 const DuePayment = require('../../models/DuePayment');
+const ActiveLoan = require('../../models/ActiveLoan');
 const { sendSuccess, sendError } = require('../../utils/responseHandler');
 
 const initiateDebiCheckMandate = asyncHandler(async (req, res) => {
@@ -43,7 +44,21 @@ const rescheduleNuPayInstalment = asyncHandler(async (req, res) => {
       trackingIndicator
     });
 
+    // 1. Update the ActiveLoan schedule item due date so the sync doesn't overwrite it
+    const loan = await ActiveLoan.findById(duePayment.loanId);
+    if (loan) {
+      const inst = loan.repaymentSchedule.find(i => i.installmentNumber === duePayment.installmentNumber);
+      if (inst) {
+        inst.dueDate = new Date(submitDate);
+        inst.paymentStatus = 'Pending'; // Reset to pending if it was overdue
+        await loan.save();
+      }
+    }
+
+    // 2. Update the DuePayment record
     duePayment.dueStatus = 'Rescheduled';
+    duePayment.dueDate = new Date(submitDate);
+    duePayment.overdueDays = 0; // Reset overdue days
     await duePayment.save();
 
     sendSuccess(res, 'Instalment rescheduled successfully via NuPay', { result });

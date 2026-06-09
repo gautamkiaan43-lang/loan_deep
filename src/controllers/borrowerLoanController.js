@@ -218,6 +218,7 @@ exports.submitFullApplication = asyncHandler(async (req, res, next) => {
   }, rules);
 
   if (!validationResult.isValid) {
+    console.error('[SUBMIT FULL VALIDATION FAILED] errors:', validationResult.errors);
     return res.status(400).json({
       success: false,
       validationErrors: validationResult.errors

@@ -29,7 +29,7 @@ const duePaymentSchema = new mongoose.Schema({
   penaltyAmount: { type: Number, default: 0 },
   totalDueAmount: { type: Number, required: true },
 
-  dueStatus: { type: String, enum: ['Due Today', 'Overdue', 'Paid'], default: 'Due Today' },
+  dueStatus: { type: String, enum: ['Due Today', 'Overdue', 'Paid', 'Rescheduled', 'Cancelled', 'Recalled'], default: 'Due Today' },
   lateDayStatus: { type: String, enum: ['On Time', '1-7 Days Late', '8+ Days Late'], default: 'On Time' },
 
   reminderStatus: { type: String, enum: ['Pending Reminder', 'Reminder Sent', 'Escalated'], default: 'Pending Reminder' },
