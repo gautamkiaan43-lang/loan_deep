@@ -60,7 +60,52 @@ if (process.env.NODE_ENV === 'development') {
 // Set security headers
 app.use(helmet());
 // Enable CORS
-app.use(cors());
+/* =========================
+   CORS CONFIGURATION
+========================= */
+
+const allowedOrigins = [
+  'https://point47.co.za',
+  'https://www.point47.co.za',
+  'http://localhost:3000',
+  'http://localhost:5173'
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow Postman, mobile apps, server-to-server requests
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    console.log(`Blocked Origin: ${origin}`);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Origin',
+    'X-Requested-With',
+    'Content-Type',
+    'Accept',
+    'Authorization'
+  ]
+};
+
+app.use(cors(corsOptions));
+
+// Handle preflight requests
+app.options(/.*/, cors(corsOptions));
+
+
+
+
+
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 10 * 60 * 1000, // 10 mins
