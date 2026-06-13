@@ -23,8 +23,14 @@ const calculateAge = (dob) => {
 const parseEmploymentMonths = (val) => {
   if (val === undefined || val === null) return 0;
   if (typeof val === 'number') return val;
-  const match = String(val).match(/\d+/);
-  return match ? parseInt(match[0], 10) : 0;
+  const strVal = String(val).toLowerCase();
+  const match = strVal.match(/\d+/);
+  if (!match) return 0;
+  let months = parseInt(match[0], 10);
+  if (strVal.includes('year') || strVal.includes('yr')) {
+    months = months * 12;
+  }
+  return months;
 };
 
 /**

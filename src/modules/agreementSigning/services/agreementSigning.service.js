@@ -4,6 +4,7 @@ const User = require('../../../models/User');
 const { generateAndSaveOTP } = require('./otpGenerator.service');
 const { verifyOTP } = require('./otpVerification.service');
 const { sendOtpEmail } = require('../../../integrations/emailjs/emailjs.service');
+const { sendOtpSms } = require('../../../integrations/sms/sms.service');
 const { createNotification } = require('../../../utils/notificationHelper');
 const BorrowerAlert = require('../../../models/BorrowerAlert');
 const LoanActivity = require('../../../models/LoanActivity');
@@ -105,7 +106,7 @@ const sendAgreementOTP = async (loanApplicationId, requestUser) => {
   console.log(`[AgreementService] OTP generated successfully for borrower ${borrowerUser._id}. Expiration: ${otpRecord.expiresAt}`);
 
   try {
-    // Send EmailJS request with 4 arguments: email, userName, otpCode, and agreement number (applicationId)
+    // Send EmailJS request
     await sendOtpEmail(
       application.emailAddress, 
       application.fullName, 
@@ -113,9 +114,20 @@ const sendAgreementOTP = async (loanApplicationId, requestUser) => {
       application.applicationId
     );
     console.log(`[AgreementService] OTP Email sent successfully to ${application.emailAddress} for agreement ${application.applicationId}`);
+
+    // Send SMS via BulkSMS integration
+    if (application.phoneNumber) {
+      // Don't wait for it to block the main flow, or wrap in a generic try-catch to avoid failing the whole process if SMS fails
+      try {
+        await sendOtpSms(application.phoneNumber, otpRecord.otpCode, application.applicationId);
+      } catch (smsError) {
+        console.error(`[AgreementService] Non-fatal: SMS dispatch failed to ${application.phoneNumber}: ${smsError.message}`);
+      }
+    }
+
   } catch (error) {
-    console.error(`[AgreementService] OTP Email send failure to ${application.emailAddress} for agreement ${application.applicationId}: ${error.message}`);
-    throw new Error(`Email dispatch failed: ${error.message}`);
+    console.error(`[AgreementService] OTP dispatch failure for agreement ${application.applicationId}: ${error.message}`);
+    throw new Error(`Dispatch failed: ${error.message}`);
   }
 
   return {
